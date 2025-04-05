@@ -1,8 +1,9 @@
 import argparse
 import asyncio
 import os
-import sys
-from pathlib import Path
+import time
+
+import aiosqlite
 
 from deepsearch_code import db, github_client, indexer, materialize, settings
 
@@ -75,7 +76,7 @@ async def run_search_tool(repo_name: str):
                     """,
                     (query,),
                 )
-                results = await cursor.fetchall()
+                results = list(await cursor.fetchall())
                 await cursor.close()
                 end_time = time.time()
 
