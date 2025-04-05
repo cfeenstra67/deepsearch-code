@@ -18,7 +18,11 @@ async def main():
 
     agent = core.Agent(conversation, [ripgrep])
 
-    response = await agent.run("How's it working?")
+    tool = core.AgentTool("the best agent", "blah", agent)
+
+    agent2 = core.Agent(conversation.new(), [tool])
+
+    response = await agent2.run("How's it working?")
 
     print("RESPONSE", response.answer)
 

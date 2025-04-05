@@ -72,7 +72,7 @@ class Conversation:
             Message(
                 role="assistant",
                 content=json.dumps(
-                    {"tool": tool.name, "args": args.model_dump(mode="json")}
+                    {"tool": tool.name(), "args": args.model_dump(mode="json")}
                 ),
             )
         )
@@ -210,3 +210,38 @@ class Agent(Generic[AgentOutput]):
             message = Message("user", string_value)
 
         return respond.response
+
+
+class AgentInput(BaseModel):
+    question: str
+
+
+class AgentTool(Tool[ToolInput, AgentOutput]):
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        agent: Agent[AgentOutput],
+        input_schema: Type[ToolInput] = AgentInput,  # type: ignore
+    ) -> None:
+        self._name = name
+        self._description = description
+        self.agent = agent
+        self.input_schema = input_schema
+
+    def name(self) -> str:
+        return self._name
+
+    def description(self) -> str:
+        return self._description
+
+    def args(self) -> Type[ToolInput]:
+        return self.input_schema
+
+    async def call(self, args: ToolInput) -> AgentOutput:
+        question = f"You are provided with the following input:\n{json.dumps(args.model_dump(mode='json'), indent=2)}"
+
+        return await self.agent.run(question)
+
+    def format(self, output: AgentOutput) -> str:
+        return json.dumps(output.model_dump(mode="json"), indent=2)
