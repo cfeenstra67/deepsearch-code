@@ -1,0 +1,24 @@
+[project]
+name = "deepsearch-code"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles>=24.1.0",
+    "aiohttp>=3.11.16",
+    "aiosqlite>=0.21.0",
+    "openai>=1.70.0",
+    "python-dotenv>=1.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15.0",
+    "ruff>=0.11.4",
+    "types-aiofiles>=24.1.0.20250326",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+ignore = ["F403"]
