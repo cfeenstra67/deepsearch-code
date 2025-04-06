@@ -15,14 +15,17 @@ async def main():
     conversation = core.Conversation(oracle)
 
     ripgrep = core.RipGrep(10)
+    read_file = core.ReadFile(10)
 
-    agent = core.Agent(conversation, [ripgrep])
+    agent = core.BasicAgent([ripgrep, read_file])
 
-    tool = core.AgentTool("the best agent", "blah", agent)
+    tool = agent.tool(
+        "best_agent", "blah", lambda x: f"Message from your supervisor:\n{x}"
+    )
 
-    agent2 = core.Agent(conversation.new(), [tool])
+    agent2 = core.BasicAgent([tool])
 
-    response = await agent2.run("How's it working?")
+    response = await agent2.run(conversation, "How's it working?")
 
     print("RESPONSE", response.answer)
 
