@@ -281,8 +281,6 @@ class LLMToolUseOracle(Oracle):
             **cast(Any, self.kwargs),
         )
 
-        print("RESPONSE", response.choices[0])
-
         tool_call = response.choices[0].message.tool_calls[0]
         raw = response.choices[0].message.content
 
