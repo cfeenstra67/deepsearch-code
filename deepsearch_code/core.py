@@ -10,6 +10,7 @@ import textwrap
 from typing import Any, Awaitable, Callable, Generic, Literal, Type, TypeVar, cast
 
 import openai
+from litellm import model_cost
 from openai.types.chat import ChatCompletionMessageToolCall, ChatCompletionToolParam
 from pydantic import BaseModel, TypeAdapter, ValidationError, create_model
 
@@ -246,10 +247,84 @@ class ReplOracle(Oracle):
         return Message(role="user", content=raw), tool, input_obj
 
 
+def compute_model_cost(
+    model: str, input: int, output: int, cached_input: int = 0
+) -> float | None:
+    cost_data = None
+    if f"openrouter/{model}" in model_cost:
+        cost_data = model_cost[f"openrouter/{model}"]
+    elif model in model_cost:
+        cost_data = model_cost[model]
+    elif "/" in model:
+        provider, model_name = model.split("/", 1)
+        if model_name in model_cost and model_cost[model_name][
+            "litellm_provider"
+        ].startswith(provider):
+            cost_data = model_cost[model_name]
+
+    if cost_data is None:
+        return None
+
+    if cost_data.get("cache_read_input_token_cost") is not None:
+        non_cached_prompt = input - cached_input
+        prompt_cost = cost_data["input_cost_per_token"] * non_cached_prompt
+        prompt_cost += cost_data["cache_read_input_token_cost"] * cached_input
+    else:
+        prompt_cost = cost_data["input_cost_per_token"] * input
+
+    completion_cost = cost_data["output_cost_per_token"] * output
+
+    return prompt_cost + completion_cost
+
+
+def compute_cost(usage: dict[str, dict[str, Any]]) -> float | None:
+    items = []
+    for model, tokens in usage.items():
+        result = compute_model_cost(
+            model, tokens["input"], tokens["output"], tokens["cached_input"]
+        )
+        if result is not None:
+            items.append(result)
+
+    if not items:
+        return None
+
+    return sum(items)
+
+
+class UsageTracker:
+    def __init__(self) -> None:
+        self.models: dict[str, dict[str, Any]] = {}
+
+    def log(
+        self, model: str, total: int, input: int, output: int, cached_input: int = 0
+    ) -> None:
+        self.models.setdefault(
+            model, {"count": 0, "total": 0, "input": 0, "output": 0, "cached_input": 0}
+        )
+        self.models[model]["count"] += 1
+        self.models[model]["total"] += total
+        self.models[model]["input"] += input
+        self.models[model]["output"] += output
+        self.models[model]["cached_input"] += cached_input
+
+    def cost(self) -> float | None:
+        return compute_cost(self.models)
+
+
 class LLMToolUseOracle(Oracle):
-    def __init__(self, model: str, client: openai.AsyncOpenAI, **kwargs) -> None:
+    def __init__(
+        self,
+        model: str,
+        client: openai.AsyncOpenAI,
+        tracker: UsageTracker | None = None,
+        **kwargs,
+    ) -> None:
+        if tracker is None:
+            tracker = UsageTracker()
         self.model = model
         self.client = client
+        self.tracker = tracker
         self.kwargs = kwargs
 
     async def ask(
@@ -281,8 +356,21 @@ class LLMToolUseOracle(Oracle):
             **cast(Any, self.kwargs),
         )
 
-        tool_call = response.choices[0].message.tool_calls[0]
+        if response.usage is not None:
+            cached_input = 0
+            if response.usage.prompt_tokens_details:
+                cached_input = response.usage.prompt_tokens_details.cached_tokens or 0
+
+            self.tracker.log(
+                self.model,
+                input=response.usage.prompt_tokens,
+                output=response.usage.completion_tokens,
+                total=response.usage.total_tokens,
+                cached_input=cached_input,
+            )
+
         raw = response.choices[0].message.content
+        tool_call = response.choices[0].message.tool_calls[0]
 
         tool_name = tool_call.function.name
         args = json.loads(tool_call.function.arguments)
@@ -298,13 +386,6 @@ class LLMToolUseOracle(Oracle):
         )
 
         return msg, tool_obj, input_obj
-
-
-class Test(BaseModel):
-    pass
-
-
-s = Test.model_json_schema()
 
 
 class ScrollableString:
