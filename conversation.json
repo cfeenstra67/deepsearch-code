@@ -1,0 +1,42 @@
+[
+  {
+    "role": "user",
+    "content": "You are playing 'O'\nCurrent board:\n0 X| | \n  -----\n1  | | \n  -----\n2  | | \n  0 1 2\n\nWhat's your next move?",
+    "tool_calls": []
+  },
+  {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+      {
+        "id": "call_vRpSadp7teSXf8HY4o2jFDrX",
+        "function": {
+          "arguments": "{\"row\":0,\"col\":2}",
+          "name": "play"
+        },
+        "type": "function",
+        "index": 0
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": "You are playing 'O'\nCurrent board:\n0 X| |O\n  -----\n1  |X| \n  -----\n2  | | \n  0 1 2\n\nWhat's your next move?",
+    "tool_calls": []
+  },
+  {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+      {
+        "id": "call_jE20Lbh0ms0QNWIlIYRKYEcu",
+        "function": {
+          "arguments": "{\"row\":1,\"col\":0}",
+          "name": "play"
+        },
+        "type": "function",
+        "index": 0
+      }
+    ]
+  }
+]

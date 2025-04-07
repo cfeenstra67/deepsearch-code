@@ -7,9 +7,10 @@ import os
 import shlex
 import tempfile
 import textwrap
-from typing import Any, Awaitable, Callable, Generic, Literal, Type, TypeVar
+from typing import Any, Awaitable, Callable, Generic, Literal, Type, TypeVar, cast
 
-import aioconsole
+import openai
+from openai.types.chat import ChatCompletionMessageToolCall, ChatCompletionToolParam
 from pydantic import BaseModel, TypeAdapter, ValidationError, create_model
 
 ToolInput = TypeVar("ToolInput", bound=BaseModel)
@@ -18,6 +19,9 @@ ToolOutput = TypeVar("ToolOutput")
 
 
 class Tool(Generic[ToolInput, ToolOutput], abc.ABC):
+    def enabled(self) -> bool:
+        return True
+
     @abc.abstractmethod
     def name(self) -> str:
         raise NotImplementedError
@@ -112,10 +116,10 @@ def tool(
     )
 
 
-@dc.dataclass(frozen=True)
-class Message:
+class Message(BaseModel):
     role: Literal["user", "assistant", "system"]
     content: str
+    tool_calls: list[ChatCompletionMessageToolCall] = dc.field(default_factory=list)
 
 
 class Prompt(abc.ABC):
@@ -157,7 +161,7 @@ class Oracle(abc.ABC):
     @abc.abstractmethod
     async def ask(
         self, messages: list[Message], tools: list[Tool]
-    ) -> tuple[str, Tool, Any]:
+    ) -> tuple[Message, Tool, Any]:
         raise NotImplementedError
 
 
@@ -185,12 +189,12 @@ class Conversation:
 
         system_message = prompt.system_message()
         if system_message is not None:
-            msg = Message("system", system_message)
+            msg = Message(role="system", content=system_message)
             all_messages.insert(0, msg)
 
         raw, tool, args = await self.oracle.ask(all_messages, tools)
         self.messages.append(message)
-        self.messages.append(Message(role="assistant", content=raw))
+        self.messages.append(raw)
 
         return tool, args
 
@@ -198,13 +202,14 @@ class Conversation:
 class ReplOracle(Oracle):
     async def ask(
         self, messages: list[Message], tools: list[Tool]
-    ) -> tuple[str, Tool, Any]:
+    ) -> tuple[Message, Tool, Any]:
         for message in messages:
             print(f"Role: {message.role}")
             print(f"Content: {message.content}")
             print()
 
         tools_by_name = {tool.name(): tool for tool in tools}
+        tool: Tool | None = None
         if len(tools_by_name) == 1:
             tool_name, tool = next(iter(tools_by_name.items()))
         else:
@@ -213,9 +218,8 @@ class ReplOracle(Oracle):
                 print(f"{available_tool.name()}: {available_tool.description()}")
             print()
 
-            tool: Tool | None = None
             while tool is None:
-                tool_name = await aioconsole.ainput("Input tool name: ")
+                tool_name = input("Input tool name: ")
                 if tool_name in tools_by_name:
                     tool = tools_by_name[tool_name]
                 else:
@@ -226,7 +230,7 @@ class ReplOracle(Oracle):
         fields = {}
         for field, value in input_schema.model_fields.items():
             while True:
-                raw = await aioconsole.ainput(f"{field}: ")
+                raw = input(f"{field}: ")
                 try:
                     fields[field] = TypeAdapter(value.annotation).validate_python(raw)
                     break
@@ -239,14 +243,70 @@ class ReplOracle(Oracle):
 
         raw = f"Called {tool_name} with {json.dumps(fields)}"
 
-        return raw, tool, input_obj
+        return Message(role="user", content=raw), tool, input_obj
 
 
-# class LLMOracle(Oracle):
-#     async def ask(
-#         self, messages: list[Message], tools: list[Tool]
-#     ) -> tuple[str, Tool, Any]:
-#         pass
+class LLMToolUseOracle(Oracle):
+    def __init__(self, model: str, client: openai.AsyncOpenAI, **kwargs) -> None:
+        self.model = model
+        self.client = client
+        self.kwargs = kwargs
+
+    async def ask(
+        self, messages: list[Message], tools: list[Tool]
+    ) -> tuple[Message, Tool, Any]:
+        model_tools: list[ChatCompletionToolParam] = []
+        tools_by_name: dict[str, Tool] = {}
+        for tool in tools:
+            name = tool.name()
+            tools_by_name[name] = tool
+            model_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": tool.description(),
+                        "parameters": tool.args().model_json_schema(),
+                    },
+                }
+            )
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=cast(
+                Any, [{"role": msg.role, "content": msg.content} for msg in messages]
+            ),
+            tools=model_tools,
+            tool_choice="required",
+            **cast(Any, self.kwargs),
+        )
+
+        print("RESPONSE", response.choices[0])
+
+        tool_call = response.choices[0].message.tool_calls[0]
+        raw = response.choices[0].message.content
+
+        tool_name = tool_call.function.name
+        args = json.loads(tool_call.function.arguments)
+
+        tool_obj = tools_by_name[tool_name]
+
+        input_obj = tool_obj.args().model_validate(args)
+
+        msg = Message(
+            role="assistant",
+            content=raw,
+            tool_calls=response.choices[0].message.tool_calls,
+        )
+
+        return msg, tool_obj, input_obj
+
+
+class Test(BaseModel):
+    pass
+
+
+s = Test.model_json_schema()
 
 
 class ScrollableString:
@@ -390,15 +450,27 @@ AgentOutput = TypeVar("AgentOutput", bound=BaseModel, default=AgentResponse)
 
 
 class AgentRespond(Tool[AgentOutput, str]):
-    def __init__(self, response_schema: Type[AgentOutput]) -> None:
+    def __init__(
+        self,
+        response_schema: Type[AgentOutput],
+        name: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        if name is None:
+            name = "respond"
+        if description is None:
+            description = "Confidently provide a response to your task"
+
         self.response_schema = response_schema
         self.response: AgentOutput | None = None
+        self._name = name
+        self._description = description
 
     def name(self) -> str:
-        return "respond"
+        return self._name
 
     def description(self) -> str:
-        return "Confidently provide a response to your task"
+        return self._description
 
     def args(self) -> Type[AgentOutput]:
         return self.response_schema
@@ -422,7 +494,11 @@ class Agent(abc.ABC):
     async def run(
         self,
         question: str,
+        *,
+        response_name: str | None = None,
+        response_description: str | None = None,
         response_schema: Type[AgentOutput] = AgentResponse,  # type: ignore
+        tools: list[Tool] | None = None,
     ) -> AgentOutput:
         raise NotImplementedError
 
@@ -517,10 +593,13 @@ class BasicAgent(Agent):
     def __init__(
         self,
         conversation: Conversation,
-        tools: list[Tool],
+        tools: list[Tool] | None = None,
         prompt: Prompt = StringPrompt("You are a helpful assistant"),
         response_schema: Type[AgentOutput] = AgentResponse,  # type: ignore
     ) -> None:
+        if tools is None:
+            tools = []
+
         self.conversation = conversation
         self.tools = tools
         self.prompt = prompt
@@ -532,21 +611,36 @@ class BasicAgent(Agent):
     async def run(
         self,
         question: str,
+        *,
         response_schema: Type[AgentOutput] = AgentResponse,  # type: ignore
+        response_name: str | None = None,
+        response_description: str | None = None,
+        tools: list[Tool] | None = None,
     ) -> AgentOutput:
-        respond = AgentRespond(response_schema)
-        all_tools = [*self.tools, respond]
+        if tools is None:
+            tools = []
 
-        message = Message("user", question)
+        respond = AgentRespond(
+            response_schema, name=response_name, description=response_description
+        )
+        all_tools = self.tools + tools + [respond]
+
+        message = Message(role="user", content=question)
         message_tools = all_tools
 
         while respond.response is None:
-            tool, args = await self.conversation.ask(
-                message, message_tools, self.prompt
-            )
+            candidates = [tool for tool in message_tools if tool.enabled()]
+            if not candidates:
+                raise NoToolsAvailable
+
+            tool, args = await self.conversation.ask(message, candidates, self.prompt)
             response, follow_up_tools = await tool.call(args)
             string_value = tool.format(response)
-            message = Message("user", string_value)
+            message = Message(role="user", content=string_value)
             message_tools = all_tools + follow_up_tools
 
         return respond.response
+
+
+class NoToolsAvailable(Exception):
+    pass
