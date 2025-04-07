@@ -1,12 +1,6 @@
 import asyncio
 
-from pydantic import BaseModel
-
 from deepsearch_code import core
-
-
-class QuestionResponse(BaseModel):
-    answer: str
 
 
 async def main():
@@ -17,13 +11,17 @@ async def main():
     ripgrep = core.RipGrep(10)
     read_file = core.ReadFile(10)
 
-    agent = core.BasicAgent([ripgrep, read_file])
+    agent = core.BasicAgent(
+        core.StringPrompt("You are an asshole"), [ripgrep, read_file]
+    )
 
     tool = agent.tool(
         "best_agent", "blah", lambda x: f"Message from your supervisor:\n{x}"
     )
 
-    agent2 = core.BasicAgent([tool])
+    agent2 = core.BasicAgent(
+        core.StringPrompt("You are supervising an asshole"), [tool]
+    )
 
     response = await agent2.run(conversation, "How's it working?")
 

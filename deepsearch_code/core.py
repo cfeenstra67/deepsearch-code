@@ -9,7 +9,8 @@ import tempfile
 import textwrap
 from typing import Any, Awaitable, Callable, Generic, Literal, Type, TypeVar
 
-from pydantic import BaseModel, TypeAdapter, create_model
+import aioconsole
+from pydantic import BaseModel, TypeAdapter, ValidationError, create_model
 
 ToolInput = TypeVar("ToolInput", bound=BaseModel)
 
@@ -30,9 +31,7 @@ class Tool(Generic[ToolInput, ToolOutput], abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def call(
-        self, args: ToolInput, conversation: "Conversation"
-    ) -> tuple[ToolOutput, list["Tool"]]:
+    async def call(self, args: ToolInput) -> tuple[ToolOutput, list["Tool"]]:
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -42,9 +41,7 @@ class Tool(Generic[ToolInput, ToolOutput], abc.ABC):
 
 @dc.dataclass(frozen=True)
 class FunctionTool(Tool[ToolInput, ToolOutput]):
-    func: Callable[
-        [ToolInput, "Conversation"], Awaitable[tuple[ToolOutput, list[Tool]]]
-    ]
+    func: Callable[[ToolInput], Awaitable[tuple[ToolOutput, list[Tool]]]]
     tool_name: str
     tool_description: str
     tool_args: Type[ToolInput]
@@ -59,10 +56,8 @@ class FunctionTool(Tool[ToolInput, ToolOutput]):
     def args(self) -> Type[ToolInput]:
         return self.tool_args
 
-    async def call(
-        self, args: ToolInput, conversation: "Conversation"
-    ) -> tuple[ToolOutput, list["Tool"]]:
-        return await self.func(args, conversation)
+    async def call(self, args: ToolInput) -> tuple[ToolOutput, list["Tool"]]:
+        return await self.func(args)
 
     def format(self, output: ToolOutput) -> str:
         return self.tool_format(output)
@@ -87,7 +82,6 @@ def tool(
             return json.dumps(x, indent=2)
 
     input_fields = {}
-    pass_conversation = False
 
     sig = inspect.signature(func)
 
@@ -97,18 +91,12 @@ def tool(
             inspect.Parameter.VAR_KEYWORD,
         }:
             raise ValueError("Cannot use variable args w/ tool()")
-        if param_name == "conversation":
-            pass_conversation = True
-        else:
-            input_fields[param_name] = param_val.annotation
+        input_fields[param_name] = param_val.annotation
 
     input_schema = create_model(f"{name}InputSchema", **input_fields)
 
-    async def wrapper(input, conversation):
-        kws = input.model_dump()
-        if pass_conversation:
-            kws["conversation"] = conversation
-        result = func(**kws)
+    async def wrapper(input):
+        result = func(**input.model_dump())
         if inspect.isawaitable(result):
             result = await result
         if not isinstance(result, tuple):
@@ -128,6 +116,41 @@ def tool(
 class Message:
     role: Literal["user", "assistant", "system"]
     content: str
+
+
+class Prompt(abc.ABC):
+    @abc.abstractmethod
+    def system_message(self) -> str | None:
+        raise NotImplementedError
+
+
+@dc.dataclass(frozen=True)
+class StringPrompt(Prompt):
+    content: str
+    role: Literal["system"] = "system"
+
+    def system_message(self) -> str | None:
+        if self.role == "system":
+            return self.content
+        return None
+
+
+@dc.dataclass(frozen=True)
+class Prompts(Prompt):
+    prompts: list[Prompt]
+    delimiter: str = "\n\n"
+
+    def system_message(self) -> str | None:
+        messages: list[str] = []
+        for prompt in self.prompts:
+            system = prompt.system_message()
+            if system is not None:
+                messages.append(system)
+
+        if not messages:
+            return None
+
+        return self.delimiter.join(messages)
 
 
 class Oracle(abc.ABC):
@@ -153,10 +176,18 @@ class Conversation:
         return Conversation(self.oracle)
 
     def fork(self) -> "Conversation":
-        return Conversation(self.oracle, self.messages)
+        return Conversation(self.oracle, list(self.messages))
 
-    async def ask(self, message: Message, tools: list[Tool]) -> tuple[Tool, Any]:
+    async def ask(
+        self, message: Message, tools: list[Tool], prompt: Prompt
+    ) -> tuple[Tool, Any]:
         all_messages = self.messages + [message]
+
+        system_message = prompt.system_message()
+        if system_message is not None:
+            msg = Message("system", system_message)
+            all_messages.insert(0, msg)
+
         raw, tool, args = await self.oracle.ask(all_messages, tools)
         self.messages.append(message)
         self.messages.append(Message(role="assistant", content=raw))
@@ -174,25 +205,33 @@ class ReplOracle(Oracle):
             print()
 
         tools_by_name = {tool.name(): tool for tool in tools}
-        print("Available tools")
-        for available_tool in tools:
-            print(f"{available_tool.name()}: {available_tool.description()}")
-        print()
+        if len(tools_by_name) == 1:
+            tool_name, tool = next(iter(tools_by_name.items()))
+        else:
+            print("Available tools")
+            for available_tool in tools:
+                print(f"{available_tool.name()}: {available_tool.description()}")
+            print()
 
-        tool: Tool | None = None
-        while tool is None:
-            tool_name = input("Input tool name: ")
-            if tool_name in tools_by_name:
-                tool = tools_by_name[tool_name]
-            else:
-                print(f"Invalid tool: {repr(tool_name)}. Try again")
+            tool: Tool | None = None
+            while tool is None:
+                tool_name = await aioconsole.ainput("Input tool name: ")
+                if tool_name in tools_by_name:
+                    tool = tools_by_name[tool_name]
+                else:
+                    print(f"Invalid tool: {repr(tool_name)}. Try again")
 
         input_schema = tool.args()
 
         fields = {}
         for field, value in input_schema.model_fields.items():
-            raw = input(f"{field}: ")
-            fields[field] = TypeAdapter(value.annotation).validate_strings(raw)
+            while True:
+                raw = await aioconsole.ainput(f"{field}: ")
+                try:
+                    fields[field] = TypeAdapter(value.annotation).validate_python(raw)
+                    break
+                except ValidationError:
+                    print("Invalid response. Try again")
 
         input_obj = input_schema.model_validate(fields)
 
@@ -201,6 +240,13 @@ class ReplOracle(Oracle):
         raw = f"Called {tool_name} with {json.dumps(fields)}"
 
         return raw, tool, input_obj
+
+
+# class LLMOracle(Oracle):
+#     async def ask(
+#         self, messages: list[Message], tools: list[Tool]
+#     ) -> tuple[str, Tool, Any]:
+#         pass
 
 
 class ScrollableString:
@@ -285,9 +331,7 @@ class RipGrep(Tool[RipGrepArgs, str]):
     def args(self) -> Type[RipGrepArgs]:
         return RipGrepArgs
 
-    async def call(
-        self, args: RipGrepArgs, conversation: Conversation | None = None
-    ) -> tuple[str, list[Tool]]:
+    async def call(self, args: RipGrepArgs) -> tuple[str, list[Tool]]:
         with tempfile.TemporaryFile() as ntf, open(os.devnull, "ab") as devnull:
             rg_args = ["--heading", "--line-number", *shlex.split(args.args)]
 
@@ -326,9 +370,7 @@ class ReadFile(Tool[ReadFileArgs, str]):
     def args(self) -> Type[ReadFileArgs]:
         return ReadFileArgs
 
-    async def call(
-        self, args: ReadFileArgs, conversation: Conversation | None = None
-    ) -> tuple[str, list[Tool]]:
+    async def call(self, args: ReadFileArgs) -> tuple[str, list[Tool]]:
         with open(args.path) as f:
             content = f.read()
 
@@ -340,7 +382,11 @@ class ReadFile(Tool[ReadFileArgs, str]):
         return output
 
 
-AgentOutput = TypeVar("AgentOutput", bound=BaseModel)
+class AgentResponse(BaseModel):
+    answer: str
+
+
+AgentOutput = TypeVar("AgentOutput", bound=BaseModel, default=AgentResponse)
 
 
 class AgentRespond(Tool[AgentOutput, str]):
@@ -357,9 +403,7 @@ class AgentRespond(Tool[AgentOutput, str]):
     def args(self) -> Type[AgentOutput]:
         return self.response_schema
 
-    async def call(
-        self, args: AgentOutput, conversation: Conversation | None = None
-    ) -> tuple[str, list[Tool]]:
+    async def call(self, args: AgentOutput) -> tuple[str, list[Tool]]:
         self.response = args
         return "Your response has been recorded. You're done!", []
 
@@ -367,20 +411,19 @@ class AgentRespond(Tool[AgentOutput, str]):
         return output
 
 
-class Agent(Generic[AgentOutput], abc.ABC):
+class Agent(abc.ABC):
+    conversation: Conversation
+
     @abc.abstractmethod
-    async def run(self, conversation: Conversation, question: str) -> AgentOutput:
+    def clone(self, conversation: Conversation) -> "Agent":
         raise NotImplementedError
 
     @abc.abstractmethod
-    def tool(
+    async def run(
         self,
-        name: str,
-        description: str,
-        question: Callable[[str], str] | None = None,
-        conversation: Conversation | None = None,
-        fork: bool = False,
-    ) -> Tool:
+        question: str,
+        response_schema: Type[AgentOutput] = AgentResponse,  # type: ignore
+    ) -> AgentOutput:
         raise NotImplementedError
 
 
@@ -393,11 +436,14 @@ class AgentTool(Tool[AgentInput, AgentOutput]):
         self,
         name: str,
         description: str,
-        agent: "Agent[AgentOutput]",
+        agent: Agent,
         fork: bool = False,
         question: Callable[[str], str] | None = None,
-        conversation: Conversation | None = None,
+        tools: list[Callable[[Agent], Tool]] | None = None,
     ) -> None:
+        if tools is None:
+            tools = []
+
         if question is None:
 
             def question(x: str) -> str:
@@ -408,7 +454,7 @@ class AgentTool(Tool[AgentInput, AgentOutput]):
         self.agent = agent
         self.fork = fork
         self.question = question
-        self.conversation = conversation
+        self.tools = tools
 
     def name(self) -> str:
         return self._name
@@ -419,26 +465,17 @@ class AgentTool(Tool[AgentInput, AgentOutput]):
     def args(self) -> Type[AgentInput]:
         return AgentInput
 
-    async def call(
-        self, args: AgentInput, conversation: Conversation
-    ) -> tuple[AgentOutput, list[Tool]]:
+    async def call(self, args: AgentInput) -> tuple[AgentOutput, list[Tool]]:
         question = self.question(args.question)
 
-        convo = self.conversation
-        if convo is None:
-            convo = conversation.fork() if self.fork else conversation.new()
+        conversation = self.agent.conversation
+        conversation = conversation.fork() if self.fork else conversation.new()
+        agent = self.agent.clone(conversation)
 
-        tools: list[Tool] = []
-        if not self.fork:
-            tool = self.agent.tool(
-                name="request_changes",
-                description=f"Request changes to the previous response from {self._name}",
-                question=lambda x: f"The following changes have been requested:\n{x}",
-                conversation=convo,
-            )
-            tools.append(tool)
+        response: AgentOutput = await agent.run(question)
+        tools = [tool(agent) for tool in self.tools]
 
-        return await self.agent.run(convo, question), tools
+        return response, tools
 
     def format(self, output: AgentOutput) -> str:
         if isinstance(output, AgentResponse):
@@ -446,48 +483,70 @@ class AgentTool(Tool[AgentInput, AgentOutput]):
         return json.dumps(output.model_dump(mode="json"), indent=2)
 
 
-class AgentResponse(BaseModel):
-    answer: str
+def agent_tool(
+    agent: Agent,
+    name: str,
+    description: str,
+    question: Callable[[str], str] | None = None,
+    fork: bool = False,
+) -> Tool[AgentInput, AgentOutput]:
+    tools: list[Callable[[Agent], Tool]] = []
+    if not fork:
+
+        def request_changes(agent: Agent) -> Tool:
+            return AgentTool(
+                agent=agent,
+                name="request_changes",
+                description=f"Request changes to the previous response from {name}",
+                question=lambda x: f"The following changes have been requested:\n{x}",
+            )
+
+        tools.append(request_changes)
+
+    return AgentTool(
+        name=name,
+        description=description,
+        agent=agent,
+        question=question,
+        fork=fork,
+        tools=tools,
+    )
 
 
-class BasicAgent(Agent[AgentOutput]):
+class BasicAgent(Agent):
     def __init__(
         self,
+        conversation: Conversation,
         tools: list[Tool],
+        prompt: Prompt = StringPrompt("You are a helpful assistant"),
         response_schema: Type[AgentOutput] = AgentResponse,  # type: ignore
     ) -> None:
-        self.response_schema = response_schema
+        self.conversation = conversation
         self.tools = tools
+        self.prompt = prompt
+        self.response_schema = response_schema
 
-    async def run(self, conversation: Conversation, question: str) -> AgentOutput:
-        respond = AgentRespond(self.response_schema)
+    def clone(self, conversation: Conversation) -> Agent:
+        return BasicAgent(conversation, self.tools, self.prompt, self.response_schema)
+
+    async def run(
+        self,
+        question: str,
+        response_schema: Type[AgentOutput] = AgentResponse,  # type: ignore
+    ) -> AgentOutput:
+        respond = AgentRespond(response_schema)
         all_tools = [*self.tools, respond]
 
         message = Message("user", question)
         message_tools = all_tools
 
         while respond.response is None:
-            tool, args = await conversation.ask(message, message_tools)
-            response, follow_up_tools = await tool.call(args, conversation)
+            tool, args = await self.conversation.ask(
+                message, message_tools, self.prompt
+            )
+            response, follow_up_tools = await tool.call(args)
             string_value = tool.format(response)
             message = Message("user", string_value)
             message_tools = all_tools + follow_up_tools
 
         return respond.response
-
-    def tool(
-        self,
-        name: str,
-        description: str,
-        question: Callable[[str], str] | None = None,
-        conversation: Conversation | None = None,
-        fork: bool = False,
-    ) -> Tool:
-        return AgentTool(
-            name=name,
-            description=description,
-            agent=self,
-            question=question,
-            conversation=conversation,
-            fork=fork,
-        )
