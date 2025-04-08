@@ -129,6 +129,21 @@ class TicTacToe:
     def player_marker(self, player: int) -> str:
         return self.markers[player - 1]
 
+    def construct_question(self, player: int, messages: list[str]) -> str:
+        char = self.player_marker(player)
+        prompt = f"""
+You are placing '{char}'
+Current board:
+{self.print_board()}
+
+What's your next move?
+""".strip()
+
+        if messages:
+            prompt = "\n\n".join(["\n".join(messages), prompt])
+
+        return prompt
+
     async def run(
         self,
         player1: core.Agent,
@@ -142,6 +157,24 @@ class TicTacToe:
             "response_description": "Make your next move",
         }
 
+        flash_messages: dict[int, list[str]] = {}
+
+        for player in [1, 2]:
+            wins = "even" if player == 1 else "odd"
+            symbol = self.player_marker(player)
+            flash_messages[player] = [
+                f"You are Player {player}; you'll be playing '{symbol}'. A 12-sided dice roll will be used to determine who goes first. If it's {wins}, you'll go first."
+            ]
+
+        dice_roll = random.randint(1, 12)
+        dice_winner = 1 if dice_roll % 2 == 0 else 2
+        for msgs in flash_messages.values():
+            msgs.append(
+                f"The dice roll is {dice_roll}. Player {dice_winner} will go first."
+            )
+
+        self.turn = dice_winner
+
         while self.winner is None and not self.is_full():
             remaining = self.remaining_spaces()
             if len(remaining) == 1:
@@ -151,7 +184,6 @@ class TicTacToe:
 
             player_num = self.turn
             agent = agents[player_num - 1]
-            char = self.player_marker(player_num)
 
             def forfeit(reason: str):
                 """
@@ -159,10 +191,12 @@ class TicTacToe:
                 """
                 raise Forfeit(player_num, reason)
 
+            msgs = flash_messages.get(player_num, [])
+            prompt = self.construct_question(player_num, msgs)
+            msgs.clear()
+
             response = await agent.run(
-                f"You are playing '{char}'\n"
-                f"Current board:\n{self.print_board()}\n\n"
-                "What's your next move?",
+                prompt,
                 response_schema=TicTacToeMove,
                 tools=[core.tool(forfeit)],
                 **run_kwargs,
@@ -184,6 +218,12 @@ class TicTacToe:
 
                 if not validation_errors:
                     self.take_turn(response.row, response.column)
+                    for player, msgs in flash_messages.items():
+                        if player == player_num:
+                            continue
+                        msgs.append(
+                            f"Player {player_num} plays ({response.row}, {response.column})"
+                        )
                     break
 
                 failures += 1
@@ -279,35 +319,20 @@ GameResultType = Literal["win", "loss", "tie", "forfeit", "error"]
 @dc.dataclass(frozen=True)
 class GameResult:
     type: GameResultType
-    model: str
     game: TicTacToe
-    usage: dict[str, Any] | None = None
-    cost: float | None = None
+    elapsed: float | None = None
     forfeit_reason: str | None = None
 
 
 async def play_game(
     game: TicTacToe,
-    model: str,
-    client: openai.AsyncOpenAI,
-    method: str,
+    oracle: core.Oracle,
     semaphore: asyncio.Semaphore | None = None,
 ) -> GameResult:
     simple_ai_oracle = TicTacToeAIOracle(game, 2)
     simple_ai = core.BasicAgent(core.Conversation(simple_ai_oracle))
 
-    tracker = core.UsageTracker()
-    llm: core.Oracle
-    if method == "structured_outputs":
-        llm = core.LLMStructuredOutputsOracle(
-            model=model, client=client, tracker=tracker
-        )
-    elif method == "tools":
-        llm = core.LLMToolUseOracle(model=model, client=client, tracker=tracker)
-    else:
-        raise ValueError(f"Invalid method: '{method}'")
-
-    llm_convo = core.Conversation(llm)
+    llm_convo = core.Conversation(oracle)
 
     ai = core.BasicAgent(
         llm_convo,
@@ -320,9 +345,9 @@ Each turn you'll select a move and you'll place X or O at the corresponding spot
         ),
     )
 
-    # Random first move
-    row, col = random.randint(0, game.size - 1), random.randint(0, game.size - 1)
-    game.take_turn(row, col)
+    # # Random first move
+    # row, col = random.randint(0, game.size - 1), random.randint(0, game.size - 1)
+    # game.take_turn(row, col)
 
     result: GameResultType
     forfeit_reason: str | None = None
@@ -330,6 +355,7 @@ Each turn you'll select a move and you'll place X or O at the corresponding spot
         async with contextlib.AsyncExitStack() as stack:
             if semaphore is not None:
                 await stack.enter_async_context(semaphore)
+            before = time.perf_counter()
             winner = await game.run(ai, simple_ai)
         if winner is None:
             result = "tie"
@@ -345,36 +371,17 @@ Each turn you'll select a move and you'll place X or O at the corresponding spot
         result = "forfeit"
         forfeit_reason = err.reason
 
+    after = time.perf_counter()
+
     return GameResult(
-        type=result,
-        model=model,
-        game=game,
-        usage=tracker.models[model],
-        cost=tracker.cost(),
-        forfeit_reason=forfeit_reason,
+        type=result, game=game, forfeit_reason=forfeit_reason, elapsed=after - before
     )
 
 
-async def play_game_interactive(
-    model: str,
-    size: int,
-    method: str,
-    client: openai.AsyncOpenAI,
-):
-    game = TicTacToe(size)
-    result = await play_game(game, model, client, method)
-
-    print(f"Final (${result.cost:.3f}, {result.game.num_turns} turns):")
-    print(result.game.print_board())
-
-    if result.type == "forfeit":
-        print("The LLM forfeited because:", result.forfeit_reason)
-    elif result.type == "win":
-        print("The LLM won!")
-    elif result.type == "loss":
-        print("The LLM lost!")
-    else:
-        print("It's a tie!")
+class ModelInfo(BaseModel):
+    model: str
+    usage: dict[str, Any] | None
+    cost: float | None
 
 
 class ModelMetrics(BaseModel):
@@ -388,13 +395,13 @@ class ModelMetrics(BaseModel):
     final_boards: list[str]
 
 
-def compute_metrics(games: list[tuple[GameResult, float]]) -> list[ModelMetrics]:
-    games_by_model: dict[str, list[tuple[GameResult, float]]] = {}
-    for game, game_time in games:
-        games_by_model.setdefault(game.model, []).append((game, game_time))
+def compute_metrics(games: list[tuple[GameResult, ModelInfo]]) -> list[ModelMetrics]:
+    games_by_model: dict[str, list[tuple[GameResult, ModelInfo]]] = {}
+    for game, model in games:
+        games_by_model.setdefault(model.model, []).append((game, model))
 
     out: list[ModelMetrics] = []
-    for model, model_games in games_by_model.items():
+    for model_name, model_games in games_by_model.items():
         count_by_status: dict[GameResultType, int] = {}
         forfeit_reasons: list[str] = []
         final_boards: list[str] = []
@@ -405,22 +412,23 @@ def compute_metrics(games: list[tuple[GameResult, float]]) -> list[ModelMetrics]
             if game.forfeit_reason:
                 forfeit_reasons.append(game.forfeit_reason)
 
-        cost = sum(game.cost for game, _ in model_games if game.cost is not None)
+        cost = sum(model.cost for _, model in model_games if model.cost is not None)
 
         usage = {"input": 0, "output": 0, "cached_input": 0}
-        for game, _ in model_games:
-            if game.usage is None:
+        for _, model in model_games:
+            if model.usage is None:
                 continue
             for key in list(usage):
-                usage[key] += game.usage[key]
+                usage[key] += model.usage[key]
 
-        avg_time = statistics.mean(t for _, t in model_games)
+        elapsed = [game.elapsed for game, _ in model_games if game.elapsed is not None]
+        avg_time = statistics.mean(elapsed) if elapsed else -1
 
         avg_turns = statistics.mean(game.game.num_turns for game, _ in model_games)
 
         out.append(
             ModelMetrics(
-                model=model,
+                model=model_name,
                 results=count_by_status,
                 cost=cost,
                 usage=usage,
@@ -445,7 +453,7 @@ def print_metrics(metrics: list[ModelMetrics]) -> None:
         input = model_metrics.usage["input"]
         output = model_metrics.usage["output"]
         cached = model_metrics.usage["cached_input"]
-        token_state = f"{input} input ({cached} cached), {output} output"
+        token_state = f"{input:,} input ({cached:,} cached), {output:,} output"
 
         print(
             f"{model_metrics.model}: {statuses} (${model_metrics.cost:.3f}, {token_state}, "
@@ -506,40 +514,55 @@ async def benchmark(
         base_url="https://openrouter.ai/api/v1", api_key=api_key
     )
 
-    tasks: dict[asyncio.Task[GameResult], tuple[TicTacToe, str, int, float]] = {}
+    def create_oracle(tracker: core.UsageTracker) -> core.Oracle:
+        if method == "structured_outputs":
+            return core.LLMStructuredOutputsOracle(
+                model=model, client=client, tracker=tracker
+            )
+        if method == "tools":
+            return core.LLMToolUseOracle(model=model, client=client, tracker=tracker)
+        raise ValueError(f"Invalid method: '{method}'")
+
+    tasks: dict[
+        asyncio.Task[GameResult], tuple[TicTacToe, str, int, core.UsageTracker]
+    ] = {}
     size = 3
     semaphore: asyncio.Semaphore | None = None
     if concurrency is not None:
         semaphore = asyncio.Semaphore(concurrency)
     for model in model:
         for i in range(num):
+            tracker = core.UsageTracker()
+            llm = create_oracle(tracker)
+
             game = TicTacToe(size)
-            task = asyncio.create_task(
-                play_game(game, model, client, method, semaphore)
-            )
-            tasks[task] = game, model, i, time.time()
+            task = asyncio.create_task(play_game(game, llm, semaphore))
+            tasks[task] = game, model, i, tracker
 
     progress = tqdm(total=len(tasks))
 
     pending = set(tasks)
-    games: list[tuple[GameResult, float]] = []
+    games: list[tuple[GameResult, ModelInfo]] = []
     while pending:
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             progress.update(1)
-            game, model, idx, start = tasks[task]
+            game, model, idx, tracker = tasks[task]
+            info = ModelInfo(
+                model=model, usage=tracker.models.get(model), cost=tracker.cost()
+            )
             try:
-                games.append((task.result(), time.time() - start))
+                games.append((task.result(), info))
             except Exception:
                 print(f"Error w/ model {model}, game {idx}:")
                 traceback.print_exc()
-                result = GameResult(type="error", model=model, game=game)
-                games.append((result, time.time() - start))
+                result = GameResult(type="error", game=game)
+                games.append((result, info))
 
     metrics = compute_metrics(games)
     print_metrics(metrics)
 
-    total_cost = sum(game.cost for game, _ in games if game.cost is not None)
+    total_cost = sum(model.cost for _, model in games if model.cost is not None)
     print()
     print(f"Total cost: ${total_cost:.3f}")
 
@@ -554,6 +577,25 @@ async def benchmark(
                 body["timestamp"] = timestamp
                 body["method"] = method
                 f.write(json.dumps(body) + "\n")
+
+
+@async_command(cli)
+async def play():
+    size = 3
+    game = TicTacToe(size)
+
+    oracle = core.ReplOracle()
+
+    result = await play_game(game, oracle)
+
+    if result.type == "forfeit":
+        print("You forfeited because:", result.forfeit_reason)
+    elif result.type == "win":
+        print("You won!")
+    elif result.type == "loss":
+        print("You lost!")
+    else:
+        print("It's a tie!")
 
 
 if __name__ == "__main__":

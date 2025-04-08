@@ -492,8 +492,16 @@ class LLMStructuredOutputsOracle(Oracle):
                 cached_input=cached_input,
             )
 
+        if not response.choices:
+            raise RuntimeError(f"No choices in response: {response!r}")
+
         raw = response.choices[0].message.content
-        response_data = json.loads(raw)["tool"]
+        try:
+            response_data = json.loads(raw)["tool"]
+        except json.JSONDecodeError as err:
+            raise RuntimeError(
+                f"Invalid JSON in structured output response: {raw}"
+            ) from err
 
         tool_name = response_data["name"]
         args = response_data["args"]
