@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, Generic, Literal, Type, TypeVar, ca
 
 import openai
 from litellm import model_cost
+from openai.lib._pydantic import to_strict_json_schema
 from openai.types.chat import ChatCompletionMessageToolCall, ChatCompletionToolParam
 from pydantic import BaseModel, TypeAdapter, ValidationError, create_model
 
@@ -318,6 +319,7 @@ class LLMToolUseOracle(Oracle):
         model: str,
         client: openai.AsyncOpenAI,
         tracker: UsageTracker | None = None,
+        allowed_attempts: int = 1,
         **kwargs,
     ) -> None:
         if tracker is None:
@@ -325,6 +327,7 @@ class LLMToolUseOracle(Oracle):
         self.model = model
         self.client = client
         self.tracker = tracker
+        self.allowed_attempts = allowed_attempts
         self.kwargs = kwargs
 
     async def ask(
@@ -346,13 +349,133 @@ class LLMToolUseOracle(Oracle):
                 }
             )
 
+        failures = 0
+        use_messages = [{"role": msg.role, "content": msg.content} for msg in messages]
+        while failures < self.allowed_attempts:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=cast(Any, use_messages),
+                tools=model_tools,
+                tool_choice="required",
+                **cast(Any, self.kwargs),
+            )
+
+            if response.usage is not None:
+                cached_input = 0
+                if response.usage.prompt_tokens_details:
+                    cached_input = (
+                        response.usage.prompt_tokens_details.cached_tokens or 0
+                    )
+
+                self.tracker.log(
+                    self.model,
+                    input=response.usage.prompt_tokens,
+                    output=response.usage.completion_tokens,
+                    total=response.usage.total_tokens,
+                    cached_input=cached_input,
+                )
+
+            raw = response.choices[0].message.content
+            if not response.choices[0].message.tool_calls:
+                print(
+                    f"No tool call in response from {self.model}; model responded with: {raw}"
+                )
+                failures += 1
+                remaining = self.allowed_attempts - failures
+                use_messages.append(
+                    {
+                        "role": "user",
+                        "content": f"Invalid response; your respond must contain a tool call. {remaining} attempt(s) remaining",
+                    }
+                )
+                continue
+
+            tool_call = response.choices[0].message.tool_calls[0]
+            break
+
+        if failures >= self.allowed_attempts:
+            raise ValueError(
+                f"Model {self.model} was unable to give a response after {self.allowed_attempts} attempt(s)"
+            )
+
+        tool_name = tool_call.function.name
+        args = json.loads(tool_call.function.arguments)
+
+        tool_obj = tools_by_name[tool_name]
+
+        input_obj = tool_obj.args().model_validate(args)
+
+        msg = Message(
+            role="assistant",
+            content=raw,
+            tool_calls=response.choices[0].message.tool_calls,
+        )
+
+        return msg, tool_obj, input_obj
+
+
+class LLMStructuredOutputsOracle(Oracle):
+    def __init__(
+        self,
+        model: str,
+        client: openai.AsyncOpenAI,
+        tracker: UsageTracker | None = None,
+        **kwargs,
+    ) -> None:
+        if tracker is None:
+            tracker = UsageTracker()
+        self.model = model
+        self.client = client
+        self.tracker = tracker
+        self.kwargs = kwargs
+
+    async def ask(
+        self, messages: list[Message], tools: list[Tool]
+    ) -> tuple[Message, Tool, Any]:
+        tools_by_name: dict[str, Tool] = {}
+
+        schemas = []
+        for tool in tools:
+            tools_by_name[tool.name()] = tool
+            schemas.append(
+                {
+                    "type": "object",
+                    "description": tool.description(),
+                    "properties": {
+                        "name": {"type": "string", "const": tool.name()},
+                        "args": to_strict_json_schema(tool.args()),
+                    },
+                    "required": ["name", "args"],
+                    "additionalProperties": False,
+                }
+            )
+
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "reasoning": {
+                    "type": "string",
+                    "description": "The reasoning for your response",
+                },
+                "tool": {"anyOf": schemas},
+            },
+            "required": ["reasoning", "tool"],
+            "additionalProperties": False,
+        }
+
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=cast(
                 Any, [{"role": msg.role, "content": msg.content} for msg in messages]
             ),
-            tools=model_tools,
-            tool_choice="required",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ToolCall",
+                    "strict": True,
+                    "schema": response_schema,
+                },
+            },
             **cast(Any, self.kwargs),
         )
 
@@ -370,10 +493,10 @@ class LLMToolUseOracle(Oracle):
             )
 
         raw = response.choices[0].message.content
-        tool_call = response.choices[0].message.tool_calls[0]
+        response_data = json.loads(raw)["tool"]
 
-        tool_name = tool_call.function.name
-        args = json.loads(tool_call.function.arguments)
+        tool_name = response_data["name"]
+        args = response_data["args"]
 
         tool_obj = tools_by_name[tool_name]
 
@@ -382,7 +505,6 @@ class LLMToolUseOracle(Oracle):
         msg = Message(
             role="assistant",
             content=raw,
-            tool_calls=response.choices[0].message.tool_calls,
         )
 
         return msg, tool_obj, input_obj

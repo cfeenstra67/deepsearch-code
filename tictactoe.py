@@ -1,17 +1,19 @@
 #!/usr/bin/env -S uv run python
-import argparse
 import asyncio
 import contextlib
 import dataclasses as dc
 import json
 import os
+import random
 import statistics
 import time
 import traceback
-from typing import Any, Literal, cast
+from datetime import datetime
+from functools import wraps
+from typing import Any, Callable, Literal, cast
 
+import click
 import openai
-from dotenv import load_dotenv
 from pydantic import BaseModel
 from tqdm.auto import tqdm
 
@@ -20,7 +22,7 @@ from deepsearch_code import core
 
 class TicTacToeMove(BaseModel):
     row: int
-    col: int
+    column: int
 
 
 class TicTacToe:
@@ -101,8 +103,16 @@ class TicTacToe:
         self.turn = self.other_player(self.turn)
         self.num_turns += 1
 
+    def remaining_spaces(self) -> set[tuple[int, int]]:
+        return {
+            (row, col)
+            for row in range(self.size)
+            for col in range(self.size)
+            if self.board[row][col] == " "
+        }
+
     def is_full(self) -> bool:
-        return all(all(x != " " for x in row) for row in self.board)
+        return len(self.remaining_spaces()) == 0
 
     def print_board(self) -> str:
         out = []
@@ -133,6 +143,12 @@ class TicTacToe:
         }
 
         while self.winner is None and not self.is_full():
+            remaining = self.remaining_spaces()
+            if len(remaining) == 1:
+                row, col = remaining.pop()
+                self.take_turn(row, col)
+                continue
+
             player_num = self.turn
             agent = agents[player_num - 1]
             char = self.player_marker(player_num)
@@ -156,19 +172,18 @@ class TicTacToe:
             while True:
                 validation_errors: list[str] = []
                 if not (
-                    0 <= response.row < self.size and 0 <= response.col < self.size
+                    0 <= response.row < self.size and 0 <= response.column < self.size
                 ):
                     validation_errors.append(
-                        f"space w/ row {response.row}, col {response.col} does not exist"
+                        f"space w/ row {response.row}, col {response.column} does not exist"
                     )
-                elif not self.is_empty(response.row, response.col):
-                    taken_by = self.get_space(response.row, response.col)
+                elif not self.is_empty(response.row, response.column):
                     validation_errors.append(
-                        f"that space is already taken by {taken_by}"
+                        f"that space is already taken by {self.board[response.row][response.column]}"
                     )
 
                 if not validation_errors:
-                    self.take_turn(response.row, response.col)
+                    self.take_turn(response.row, response.column)
                     break
 
                 failures += 1
@@ -246,7 +261,7 @@ class TicTacToeAIOracle(core.Oracle):
         play = [t for t in tools if t.name() == "play"][0]
 
         row, col = self.best_next_move()
-        response = TicTacToeMove(row=row, col=col)
+        response = TicTacToeMove(row=row, column=col)
 
         return core.Message(role="user", content=""), play, response
 
@@ -266,6 +281,7 @@ class GameResult:
     type: GameResultType
     model: str
     game: TicTacToe
+    usage: dict[str, Any] | None = None
     cost: float | None = None
     forfeit_reason: str | None = None
 
@@ -274,29 +290,39 @@ async def play_game(
     game: TicTacToe,
     model: str,
     client: openai.AsyncOpenAI,
+    method: str,
     semaphore: asyncio.Semaphore | None = None,
 ) -> GameResult:
     simple_ai_oracle = TicTacToeAIOracle(game, 2)
     simple_ai = core.BasicAgent(core.Conversation(simple_ai_oracle))
 
     tracker = core.UsageTracker()
-    llm = core.LLMToolUseOracle(model=model, client=client, tracker=tracker)
+    llm: core.Oracle
+    if method == "structured_outputs":
+        llm = core.LLMStructuredOutputsOracle(
+            model=model, client=client, tracker=tracker
+        )
+    elif method == "tools":
+        llm = core.LLMToolUseOracle(model=model, client=client, tracker=tracker)
+    else:
+        raise ValueError(f"Invalid method: '{method}'")
+
     llm_convo = core.Conversation(llm)
 
     ai = core.BasicAgent(
         llm_convo,
         prompt=core.StringPrompt(
             f"""
-You are playing a competitive game of tic-tac-toe on a {game.size}x{game.size} board. If you win this game, it'll win you the world championship and cement you as the great of all time.
+You are playing a competitive game of tic-tac-toe on a {game.size}x{game.size} board.
 
-You know the rules, of course. Each turn you'll select a move and you'll place X or O at the corresponding spot on the board. First one to get {game.size} in a row up, down, or diagonally wins. Good luck!
+Each turn you'll select a move and you'll place X or O at the corresponding spot on the board. Your move will consist of a row and a column. First one to get {game.size} in a straight line up, down, or diagonally wins. Good luck!
 """.strip()
         ),
     )
 
-    # # Random first move
-    # row, col = random.randint(0, game.size - 1), random.randint(0, game.size - 1)
-    # game.take_turn(row, col)
+    # Random first move
+    row, col = random.randint(0, game.size - 1), random.randint(0, game.size - 1)
+    game.take_turn(row, col)
 
     result: GameResultType
     forfeit_reason: str | None = None
@@ -323,6 +349,7 @@ You know the rules, of course. Each turn you'll select a move and you'll place X
         type=result,
         model=model,
         game=game,
+        usage=tracker.models[model],
         cost=tracker.cost(),
         forfeit_reason=forfeit_reason,
     )
@@ -331,10 +358,11 @@ You know the rules, of course. Each turn you'll select a move and you'll place X
 async def play_game_interactive(
     model: str,
     size: int,
+    method: str,
     client: openai.AsyncOpenAI,
 ):
     game = TicTacToe(size)
-    result = await play_game(game, model, client)
+    result = await play_game(game, model, client, method)
 
     print(f"Final (${result.cost:.3f}, {result.game.num_turns} turns):")
     print(result.game.print_board())
@@ -353,9 +381,11 @@ class ModelMetrics(BaseModel):
     model: str
     results: dict[GameResultType, int]
     cost: float
+    usage: dict[str, Any]
     avg_time: float
     avg_turns: float
     forfeit_reasons: list[str]
+    final_boards: list[str]
 
 
 def compute_metrics(games: list[tuple[GameResult, float]]) -> list[ModelMetrics]:
@@ -367,13 +397,22 @@ def compute_metrics(games: list[tuple[GameResult, float]]) -> list[ModelMetrics]
     for model, model_games in games_by_model.items():
         count_by_status: dict[GameResultType, int] = {}
         forfeit_reasons: list[str] = []
+        final_boards: list[str] = []
         for game, _ in model_games:
+            final_boards.append(game.game.print_board())
             count_by_status.setdefault(game.type, 0)
             count_by_status[game.type] += 1
             if game.forfeit_reason:
                 forfeit_reasons.append(game.forfeit_reason)
 
         cost = sum(game.cost for game, _ in model_games if game.cost is not None)
+
+        usage = {"input": 0, "output": 0, "cached_input": 0}
+        for game, _ in model_games:
+            if game.usage is None:
+                continue
+            for key in list(usage):
+                usage[key] += game.usage[key]
 
         avg_time = statistics.mean(t for _, t in model_games)
 
@@ -384,9 +423,11 @@ def compute_metrics(games: list[tuple[GameResult, float]]) -> list[ModelMetrics]
                 model=model,
                 results=count_by_status,
                 cost=cost,
+                usage=usage,
                 avg_time=avg_time,
                 avg_turns=avg_turns,
                 forfeit_reasons=forfeit_reasons,
+                final_boards=final_boards,
             )
         )
 
@@ -401,26 +442,61 @@ def print_metrics(metrics: list[ModelMetrics]) -> None:
             if status in model_metrics.results
         )
 
+        input = model_metrics.usage["input"]
+        output = model_metrics.usage["output"]
+        cached = model_metrics.usage["cached_input"]
+        token_state = f"{input} input ({cached} cached), {output} output"
+
         print(
-            f"{model_metrics.model}: {statuses} (${model_metrics.cost:.3f}, "
-            f"avg {model_metrics.avg_time:.2f}s {model_metrics.avg_turns:.1f} turns)"
+            f"{model_metrics.model}: {statuses} (${model_metrics.cost:.3f}, {token_state}, "
+            f"avg {model_metrics.avg_time:.2f}s, {model_metrics.avg_turns:.1f} turns)"
         )
         if model_metrics.forfeit_reasons:
             unique_reasons = set(model_metrics.forfeit_reasons)
             print(f"forfitted because: {'; '.join(unique_reasons)}")
 
 
-async def main() -> None:
-    load_dotenv()
+@click.group()
+def cli():
+    pass
 
-    parser = argparse.ArgumentParser("tictactoe.py")
 
-    parser.add_argument("model", help="Model to play against", nargs="+")
-    parser.add_argument("-n", "--num", type=int, default=10)
-    parser.add_argument("-c", "--concurrency", type=int, default=None)
-    parser.add_argument("-o", "--output", default=None, help="File to write output to")
+def async_command(
+    group: click.Group, **kws
+) -> Callable[[Callable[..., Any]], click.Command]:
+    def dec(f):
+        @group.command(**kws)
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            return asyncio.run(f(*args, **kwargs))
 
-    args = parser.parse_args()
+        return wrapper
+
+    return dec
+
+
+@async_command(cli)
+@click.argument("model", nargs=-1)
+@click.option("-n", "--num", type=int, default=20)
+@click.option("-c", "--concurrency", type=int, default=None)
+@click.option("-w", "--write", default=None, help="File to write output to")
+@click.option("-a", "--append", default=None, help="File to append output to")
+@click.option(
+    "-m",
+    "--method",
+    type=click.Choice(["structured_outputs", "tools"]),
+    default="structured_outputs",
+)
+async def benchmark(
+    model: str,
+    num: int,
+    concurrency: int | None,
+    write: str | None,
+    append: str | None,
+    method: str,
+) -> None:
+    if write and append:
+        raise click.BadArgumentUsage("--write and --append cannot be used together")
 
     api_key = os.getenv("OPENROUTER_API_KEY")
     if api_key is None:
@@ -433,12 +509,14 @@ async def main() -> None:
     tasks: dict[asyncio.Task[GameResult], tuple[TicTacToe, str, int, float]] = {}
     size = 3
     semaphore: asyncio.Semaphore | None = None
-    if args.concurrency is not None:
-        semaphore = asyncio.Semaphore(args.concurrency)
-    for model in args.model:
-        for i in range(args.num):
+    if concurrency is not None:
+        semaphore = asyncio.Semaphore(concurrency)
+    for model in model:
+        for i in range(num):
             game = TicTacToe(size)
-            task = asyncio.create_task(play_game(game, model, client, semaphore))
+            task = asyncio.create_task(
+                play_game(game, model, client, method, semaphore)
+            )
             tasks[task] = game, model, i, time.time()
 
     progress = tqdm(total=len(tasks))
@@ -465,14 +543,18 @@ async def main() -> None:
     print()
     print(f"Total cost: ${total_cost:.3f}")
 
-    if args.output:
-        data = {
-            "total_cost": total_cost,
-            "models": [m.model_dump(mode="json") for m in metrics],
-        }
-        with open(args.output, "w+") as f:
-            json.dump(data, f, indent=2)
+    if write or append:
+        mode = "w+" if write else "a+"
+
+        timestamp = int(datetime.now().timestamp())
+
+        with open(cast(str, write or append), mode) as f:
+            for metric in metrics:
+                body = metric.model_dump(mode="json")
+                body["timestamp"] = timestamp
+                body["method"] = method
+                f.write(json.dumps(body) + "\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    cli()

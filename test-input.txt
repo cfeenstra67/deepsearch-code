@@ -1,4 +1,0 @@
-best_agent
-what?
-ripgrep
-python
