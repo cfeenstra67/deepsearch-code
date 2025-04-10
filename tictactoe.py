@@ -455,7 +455,6 @@ class ModelInfo(BaseModel):
 
 class OracleMetrics(BaseModel):
     name: str
-    meta: dict[str, Any] = Field(default_factory=dict)
     results: dict[PlayerResultType, int]
     cost: float
     usage: dict[str, Any]
@@ -463,6 +462,7 @@ class OracleMetrics(BaseModel):
     avg_turns: float
     forfeit_reasons: list[str]
     final_boards: list[str]
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 
 def compute_metrics(
@@ -578,7 +578,7 @@ class NamedOracle:
     name: str
     oracle: core.Oracle
     tracker: core.UsageTracker
-    meta: dict[str, Any] = Field(default_factory=dict)
+    meta: dict[str, Any]
 
 
 def create_llm_oracle(
@@ -606,10 +606,12 @@ def create_oracle(
     tracker = core.UsageTracker()
 
     if name == "me" and allow_manual:
-        return NamedOracle(name=name, oracle=core.ReplOracle(), tracker=tracker)
+        return NamedOracle(
+            name=name, oracle=core.ReplOracle(), tracker=tracker, meta={}
+        )
     if name == "minmax" and allow_minmax:
         return NamedOracle(
-            name=name, oracle=TicTacToeAIOracle(game, player), tracker=tracker
+            name=name, oracle=TicTacToeAIOracle(game, player), tracker=tracker, meta={}
         )
     if "/" not in name:
         raise ValueError(
@@ -775,7 +777,7 @@ class TournamentGamePlayer(BaseModel):
     marker: str
     type: PlayerResultType
     forfeit_reason: str | None
-    meta: dict[str, Any] = Field(default_factory=dict)
+    meta: dict[str, Any]
 
 
 class TournamentGameResult(BaseModel):
@@ -868,14 +870,16 @@ async def tournament(
         [(rating, name) for name, rating in ratings.items()], reverse=True
     )
     for rating, name in sorted_ratings:
-        statuses = ", ".join(f"{status}: {count}" for status, count in status_counts[name].items())
+        statuses = ", ".join(
+            f"{status}: {count}" for status, count in status_counts[name].items()
+        )
         print(f"{name}: {rating:.2f} ELO ({statuses})")
 
     if not output:
         return
 
     game_results = [
-        get_tournament_game_result(result, player1, player2)
+        get_tournament_game_result(result, player1, player2).model_dump(mode="json")
         for result, player1, player2 in results
     ]
 
