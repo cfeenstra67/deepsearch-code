@@ -4,6 +4,7 @@ import dataclasses as dc
 import inspect
 import json
 import os
+import re
 import shlex
 import tempfile
 import textwrap
@@ -14,6 +15,8 @@ from litellm import model_cost
 from openai.lib._pydantic import to_strict_json_schema
 from openai.types.chat import ChatCompletionMessageToolCall, ChatCompletionToolParam
 from pydantic import BaseModel, TypeAdapter, ValidationError, create_model
+
+from deepsearch_code import utils
 
 ToolInput = TypeVar("ToolInput", bound=BaseModel)
 
@@ -319,7 +322,7 @@ class LLMToolUseOracle(Oracle):
         model: str,
         client: openai.AsyncOpenAI,
         tracker: UsageTracker | None = None,
-        allowed_attempts: int = 1,
+        allowed_attempts: int = 3,
         **kwargs,
     ) -> None:
         if tracker is None:
@@ -516,6 +519,185 @@ class LLMStructuredOutputsOracle(Oracle):
         )
 
         return msg, tool_obj, input_obj
+
+
+class LLMOracle(Oracle):
+    def __init__(
+        self,
+        model: str,
+        client: openai.AsyncOpenAI,
+        allowed_attempts: int = 3,
+        tracker: UsageTracker | None = None,
+        **kwargs,
+    ) -> None:
+        if tracker is None:
+            tracker = UsageTracker()
+        self.model = model
+        self.client = client
+        self.tracker = tracker
+        self.allowed_attempts = allowed_attempts
+        self.kwargs = kwargs
+
+    async def ask(
+        self, messages: list[Message], tools: list[Tool]
+    ) -> tuple[Message, Tool, Any]:
+        tools_by_name: dict[str, Tool] = {}
+
+        tool_strs = []
+        for tool in tools:
+            name = tool.name()
+            tools_by_name[name] = tool
+            schema = utils.get_resolved_pydantic_schema(tool.args())
+            lines = [
+                f"**{name}**:- {tool.description()}",
+                f"- args schema: {json.dumps(schema)}",
+            ]
+            tool_strs.append("\n".join(lines))
+
+        tools_str = "\n\n".join(tool_strs)
+
+        tools_prompt = f"""
+First respond by thinking deeply about your next move, making observations, and spelling out your reasoning for your final decision. Then you must provide the tool that you'd like to call next to continue. The tools available to you are as follows:
+{tools_str}
+
+Your tool call should always be within your message and formatted as follows. The `args` MUST match the schema provided in the corresponding tool's description above:
+```json
+{{
+    "tool": "example",
+    "args": {{"some_field": "some_value"}}
+}}
+```
+""".strip()
+
+        message_dicts = [{"role": msg.role, "content": msg.content} for msg in messages]
+
+        message_dicts[0]["content"] += f"\n{tools_prompt}"
+
+        failures = 0
+        last_response = None
+        while failures < self.allowed_attempts:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=cast(Any, message_dicts),
+                **cast(Any, self.kwargs),
+            )
+
+            if response.usage is not None:
+                cached_input = 0
+                if response.usage.prompt_tokens_details:
+                    cached_input = (
+                        response.usage.prompt_tokens_details.cached_tokens or 0
+                    )
+
+                self.tracker.log(
+                    self.model,
+                    input=response.usage.prompt_tokens,
+                    output=response.usage.completion_tokens,
+                    total=response.usage.total_tokens,
+                    cached_input=cached_input,
+                )
+
+            if not response.choices:
+                raise RuntimeError(f"No choices in response: {response!r}")
+
+            message_dicts.append(response.choices[0].message)
+            raw = response.choices[0].message.content
+            last_response = raw
+
+            tool_call = re.search(r"```json(.+?)```", raw, re.I | re.S)
+            if not tool_call:
+                failures += 1
+                message_dicts.append(
+                    {
+                        "role": "user",
+                        "content": f"""
+You didn't provide a valid tool call in your response. Remember, your response must include a tool call formatted as follows:
+```json
+{{
+    "tool": "example",
+    "args": {{"some_field": "some_value", "other_field": true}}
+}}
+```
+You have {self.allowed_attempts - failures} attempt(s) remaining.
+""".strip(),
+                    }
+                )
+                continue
+
+            content = tool_call.group(1)
+            tool_call_data: Any = None
+            error: str | None = None
+            try:
+                tool_call_data = json.loads(content)
+                assert isinstance(tool_call_data, dict), "Tool call must be an object"
+                assert "tool" in tool_call_data, "`tool` is missing"
+                assert "args" in tool_call_data, "`args` is missing"
+            except (AssertionError, json.JSONDecodeError) as err:
+                error = str(err)
+
+            if error:
+                failures += 1
+                message_dicts.append(
+                    {
+                        "role": "user",
+                        "content": f"""
+Your tool call was not valid.
+Error: {error}
+Please try again.
+You have {self.allowed_attempts - failures} attempt(s) remaining.
+""".strip(),
+                    }
+                )
+                continue
+
+            tool_name = tool_call_data["tool"]
+            if tool_name not in tools_by_name:
+                failures += 1
+                available_tools = ", ".join(list(tools_by_name))
+                message_dicts.append(
+                    {
+                        "role": "user",
+                        "content": f"""
+You've attempted to call a tool that does not exist: {tool_name}
+As a reminder, the following tools are avilable: {available_tools}
+Please try again.
+You have {self.allowed_attempts - failures} attempt(s) remaining.
+""".strip(),
+                    }
+                )
+                continue
+
+            tool = tools_by_name[tool_name]
+
+            tool_args = tool_call_data["args"]
+            tool_input: Any = None
+            try:
+                tool_input = TypeAdapter(tool.args()).validate_python(tool_args)
+            except ValidationError as err:
+                error = str(err)
+
+            if error:
+                failures += 1
+                available_tools = ", ".join(list(tools_by_name))
+                message_dicts.append(
+                    {
+                        "role": "user",
+                        "content": f"""
+You've attempted to call a tool that does not exist: {tool_name}
+As a reminder, the following tools are avilable: {available_tools}
+Please try again.
+You have {self.allowed_attempts - failures} attempt(s) remaining.
+""".strip(),
+                    }
+                )
+                continue
+
+            return Message(role="assistant", content=raw), tool, tool_input
+
+        raise RuntimeError(
+            f"{self.model} was unable to produce a valid tool call after "
+            f"{self.allowed_attempts} attempt(s). Last response: {last_response}"
+        )
 
 
 class ScrollableString:
