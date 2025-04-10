@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import dataclasses as dc
+import itertools
 import json
 import os
 import random
@@ -393,6 +394,7 @@ async def play_game(
     player2: core.Oracle,
     semaphore: asyncio.Semaphore | None = None,
     verbose: bool = False,
+    roll_die: bool = True,
 ) -> GameResult:
     prompt = core.StringPrompt(
         f"""
@@ -418,7 +420,9 @@ Each turn you'll select a move and you'll place X or O at the corresponding spot
             if semaphore is not None:
                 await stack.enter_async_context(semaphore)
             before = time.perf_counter()
-            async for turn in game.run(player1_agent, player2_agent, verbose=verbose):
+            async for turn in game.run(
+                player1_agent, player2_agent, verbose=verbose, roll_die=roll_die
+            ):
                 current_turn = turn
         finished = True
     except Forfeit as err:
@@ -627,6 +631,7 @@ async def play_games(
     games: list[tuple[TicTacToe, NamedOracle, NamedOracle]],
     concurrency: int | None = None,
     show_progress: bool = True,
+    roll_die: bool = True,
 ) -> list[tuple[GameResult, NamedOracle, NamedOracle]]:
     semaphore: asyncio.Semaphore | None = None
     if concurrency is not None:
@@ -635,7 +640,9 @@ async def play_games(
     tasks: dict[asyncio.Task[GameResult], tuple[NamedOracle, NamedOracle]] = {}
     for game, oracle1, oracle2 in games:
         task = asyncio.create_task(
-            play_game(game, oracle1.oracle, oracle2.oracle, semaphore)
+            play_game(
+                game, oracle1.oracle, oracle2.oracle, semaphore, roll_die=roll_die
+            )
         )
         tasks[task] = oracle1, oracle2
 
@@ -722,17 +729,10 @@ async def bench(
 async def play(player1: str, player2: str) -> None:
     size = 3
     game = TicTacToe(size)
+    client = get_openai_client()
 
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if api_key is None:
-        raise ValueError("OPENROUTER_API_KEY must be set")
-
-    client = openai.AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1", api_key=api_key
-    )
-
-    player1_oracle = create_oracle(player1, client, game, 1)
-    player2_oracle = create_oracle(player2, client, game, 2)
+    player1_oracle = create_oracle(player1, client, game, 1, allow_manual=True)
+    player2_oracle = create_oracle(player2, client, game, 2, allow_manual=True)
 
     result = await play_game(
         game, player1_oracle.oracle, player2_oracle.oracle, verbose=True
@@ -752,12 +752,139 @@ async def play(player1: str, player2: str) -> None:
         print("The game exited for an unknown reason. This is unexpected")
 
 
+# Function to compute the expected score of A vs B
+def expected_score(ratingA, ratingB):
+    return 1 / (1 + 10 ** ((ratingB - ratingA) / 400))
+
+
+# Single-match Elo update
+# outcome = 1 if A wins, 0 if B wins, 0.5 for a draw
+def update_elo(ratingA, ratingB, outcome, K=32):
+    expA = expected_score(ratingA, ratingB)
+    expB = 1 - expA
+    newA = ratingA + K * (outcome - expA)
+    # outcome for B is the complement (1 - outcome if we assume no draws)
+    # or (0.5 if A got 0.5 in a draw)
+    newB = ratingB + K * ((1 - outcome) - expB)
+    return newA, newB
+
+
+class TournamentGamePlayer(BaseModel):
+    name: str
+    number: int
+    marker: str
+    type: PlayerResultType
+    forfeit_reason: str | None
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class TournamentGameResult(BaseModel):
+    winner: int | None
+    finished: bool
+    error_player: int | None
+    forfeit_player: int | None
+    forfeit_reason: str | None
+    elapsed: float | None = None
+    final_board: str
+    players: list[TournamentGamePlayer]
+
+
+def get_tournament_game_result(
+    result: GameResult, player1: NamedOracle, player2: NamedOracle
+) -> TournamentGameResult:
+    players: list[TournamentGamePlayer] = []
+    for player, oracle in [(1, player1), (2, player2)]:
+        player_result = result.player_result(player)
+        players.append(
+            TournamentGamePlayer(
+                name=oracle.name,
+                number=player,
+                marker=result.game.player_marker(player),
+                type=player_result.type,
+                forfeit_reason=player_result.forfeit_reason,
+                meta=oracle.meta,
+            )
+        )
+
+    return TournamentGameResult(
+        winner=result.winner,
+        finished=result.finished,
+        error_player=result.error_player,
+        forfeit_player=result.forfeit_player,
+        forfeit_reason=result.forfeit_reason,
+        elapsed=result.elapsed,
+        final_board=result.game.print_board(),
+        players=players,
+    )
+
+
 @async_command(cli)
 @click.argument("model", nargs=-1)
-@click.argument("-o", "--output")
-@click.argument("-c", "--concurrency", type=int, default=None)
-async def tournament(model: list[str], output: str | None) -> None:
-    pass
+@click.option("-o", "--output")
+@click.option("-c", "--concurrency", type=int, default=None)
+async def tournament(
+    model: list[str], output: str | None, concurrency: int | None
+) -> None:
+    client = get_openai_client()
+
+    games: list[tuple[TicTacToe, NamedOracle, NamedOracle]] = []
+    for model1, model2 in itertools.permutations(model, 2):
+        game = TicTacToe()
+        oracle1 = create_oracle(model1, client, game, 1)
+        oracle2 = create_oracle(model2, client, game, 2)
+        games.append((game, oracle1, oracle2))
+
+    results = await play_games(games, concurrency=concurrency)
+
+    ratings = {m: 1200 for m in model}
+    status_counts: dict[str, dict[PlayerResultType, int]] = {m: {} for m in model}
+    history = {m: [ratings[m]] for m in model}
+
+    for result, player1, player2 in results:
+        rA, rB = ratings[player1.name], ratings[player2.name]
+        p1_result = result.player_result(1)
+
+        status_counts[player1.name].setdefault(p1_result.type, 0)
+        status_counts[player1.name][p1_result.type] += 1
+
+        p2_result = result.player_result(2)
+        status_counts[player2.name].setdefault(p2_result.type, 0)
+        status_counts[player2.name][p2_result.type] += 1
+
+        if p1_result.type == "win":
+            outcome = 1.0
+        elif p1_result.type == "tie":
+            outcome = 0.5
+        else:
+            outcome = 0.0
+
+        newA, newB = update_elo(rA, rB, outcome, K=32)
+        ratings[player1.name], ratings[player2.name] = newA, newB
+        # Record after each match
+        for m in [player1.name, player2.name]:
+            history[m].append(ratings[m])
+
+    sorted_ratings = sorted(
+        [(rating, name) for name, rating in ratings.items()], reverse=True
+    )
+    for rating, name in sorted_ratings:
+        statuses = ", ".join(f"{status}: {count}" for status, count in status_counts[name].items())
+        print(f"{name}: {rating:.2f} ELO ({statuses})")
+
+    if not output:
+        return
+
+    game_results = [
+        get_tournament_game_result(result, player1, player2)
+        for result, player1, player2 in results
+    ]
+
+    final_result = {"ratings": ratings, "games": game_results}
+
+    with open(output, "w+") as f:
+        json.dump(final_result, f, indent=2)
+
+    print("Output saved to", output)
 
 
 if __name__ == "__main__":
