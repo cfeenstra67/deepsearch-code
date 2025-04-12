@@ -339,6 +339,7 @@ class Forfeit(Exception):
 
 @dc.dataclass(frozen=True)
 class GameResult:
+    timestamp: int
     game: TicTacToe
     winner: int | None
     finished: bool
@@ -420,6 +421,7 @@ Each turn you'll select a move and you'll place X or O at the corresponding spot
             if semaphore is not None:
                 await stack.enter_async_context(semaphore)
             before = time.perf_counter()
+            timestamp = int(time.time())
             async for turn in game.run(
                 player1_agent, player2_agent, verbose=verbose, roll_die=roll_die
             ):
@@ -436,6 +438,7 @@ Each turn you'll select a move and you'll place X or O at the corresponding spot
     after = time.perf_counter()
 
     return GameResult(
+        timestamp=timestamp,
         game=game,
         winner=game.winner,
         finished=finished,
@@ -495,10 +498,9 @@ def compute_metrics(
             llm_name = model.meta.get("model")
             if llm_name is None:
                 continue
-            if model.tracker.models.get(llm_name) is None:
-                continue
+            llm_usage = model.tracker.get(llm_name)
             for key in list(usage):
-                usage[key] += model.tracker.models[llm_name][key]
+                usage[key] += llm_usage[key]
 
         elapsed = [game.elapsed for game, _ in model_games if game.elapsed is not None]
         avg_time = statistics.mean(elapsed) if elapsed else -1
@@ -777,10 +779,12 @@ class TournamentGamePlayer(BaseModel):
     marker: str
     type: PlayerResultType
     forfeit_reason: str | None
+    usage: dict[str, int]
     meta: dict[str, Any]
 
 
 class TournamentGameResult(BaseModel):
+    timestamp: int
     winner: int | None
     finished: bool
     error_player: int | None
@@ -804,11 +808,13 @@ def get_tournament_game_result(
                 marker=result.game.player_marker(player),
                 type=player_result.type,
                 forfeit_reason=player_result.forfeit_reason,
+                usage=oracle.tracker.total(),
                 meta=oracle.meta,
             )
         )
 
     return TournamentGameResult(
+        timestamp=result.timestamp,
         winner=result.winner,
         finished=result.finished,
         error_player=result.error_player,
@@ -818,6 +824,77 @@ def get_tournament_game_result(
         final_board=result.game.print_board(),
         players=players,
     )
+
+
+class ModelStats(BaseModel):
+    model: str
+    count: int
+    status_counts: dict[PlayerResultType, int]
+    rating: float
+    usage: dict[str, int]
+
+
+def compute_tournament_ratings(results: list[TournamentGameResult]) -> list[ModelStats]:
+    models = {player.name for result in results for player in result.players}
+    ratings = {m: 1200 for m in models}
+    model_counts: dict[str, int] = {m: 0 for m in models}
+    status_counts: dict[str, dict[PlayerResultType, int]] = {m: {} for m in models}
+    usage: dict[str, dict[str, int]] = {m: {} for m in models}
+
+    for result in results:
+        player1 = [p for p in result.players if p.number == 1][0]
+        player2 = [p for p in result.players if p.number == 2][0]
+        rA, rB = ratings[player1.name], ratings[player2.name]
+
+        status_counts[player1.name].setdefault(player1.type, 0)
+        status_counts[player1.name][player1.type] += 1
+        model_counts[player1.name] += 1
+
+        status_counts[player2.name].setdefault(player2.type, 0)
+        status_counts[player2.name][player2.type] += 1
+        model_counts[player2.name] += 1
+
+        if player1.type == "win":
+            outcome = 1.0
+        elif player1.type == "tie":
+            outcome = 0.5
+        else:
+            outcome = 0.0
+
+        newA, newB = update_elo(rA, rB, outcome, K=32)
+        ratings[player1.name], ratings[player2.name] = newA, newB
+
+        for player in [player1, player2]:
+            for key, val in player.usage.items():
+                usage[player.name].setdefault(key, 0)
+                usage[player.name][key] += val
+
+    final = [
+        ModelStats(
+            model=model,
+            count=model_counts[model],
+            status_counts=status_counts[model],
+            rating=ratings[model],
+            usage=usage[model],
+        )
+        for model in models
+    ]
+    final.sort(key=lambda x: x.rating, reverse=True)
+
+    return final
+
+
+def print_model_stats(stats: list[ModelStats]) -> None:
+    for model_stats in stats:
+        statuses = ", ".join(
+            f"{status}: {count}" for status, count in model_stats.status_counts.items()
+        )
+        print(f"{model_stats.model}: {model_stats.rating:.2f} ELO ({statuses})")
+
+
+class TournamentResult(BaseModel):
+    stats: list[ModelStats]
+    games: list[TournamentGameResult]
 
 
 @async_command(cli)
@@ -836,59 +913,93 @@ async def tournament(
         oracle2 = create_oracle(model2, client, game, 2)
         games.append((game, oracle1, oracle2))
 
-    results = await play_games(games, concurrency=concurrency)
+    results = await play_games(games, concurrency=concurrency, roll_die=False)
 
-    ratings = {m: 1200 for m in model}
-    status_counts: dict[str, dict[PlayerResultType, int]] = {m: {} for m in model}
-    history = {m: [ratings[m]] for m in model}
+    game_results = [
+        get_tournament_game_result(result, player1, player2)
+        for result, player1, player2 in results
+    ]
 
-    for result, player1, player2 in results:
-        rA, rB = ratings[player1.name], ratings[player2.name]
-        p1_result = result.player_result(1)
+    models = compute_tournament_ratings(game_results)
 
-        status_counts[player1.name].setdefault(p1_result.type, 0)
-        status_counts[player1.name][p1_result.type] += 1
+    print_model_stats(models)
 
-        p2_result = result.player_result(2)
-        status_counts[player2.name].setdefault(p2_result.type, 0)
-        status_counts[player2.name][p2_result.type] += 1
+    # sorted_models = sorted(models, key=lambda x: x.rating, reverse=True)
+    # for model_stats in sorted_models:
+    #     statuses = ", ".join(
+    #         f"{status}: {count}" for status, count in model_stats.status_counts.items()
+    #     )
+    #     print(f"{model_stats.model}: {model_stats.rating:.2f} ELO ({statuses})")
 
-        if p1_result.type == "win":
-            outcome = 1.0
-        elif p1_result.type == "tie":
-            outcome = 0.5
-        else:
-            outcome = 0.0
+    # ratings = {m: 1200 for m in model}
+    # status_counts: dict[str, dict[PlayerResultType, int]] = {m: {} for m in model}
+    # history = {m: [ratings[m]] for m in model}
 
-        newA, newB = update_elo(rA, rB, outcome, K=32)
-        ratings[player1.name], ratings[player2.name] = newA, newB
-        # Record after each match
-        for m in [player1.name, player2.name]:
-            history[m].append(ratings[m])
+    # for result, player1, player2 in results:
+    #     rA, rB = ratings[player1.name], ratings[player2.name]
+    #     p1_result = result.player_result(1)
 
-    sorted_ratings = sorted(
-        [(rating, name) for name, rating in ratings.items()], reverse=True
-    )
-    for rating, name in sorted_ratings:
-        statuses = ", ".join(
-            f"{status}: {count}" for status, count in status_counts[name].items()
-        )
-        print(f"{name}: {rating:.2f} ELO ({statuses})")
+    #     status_counts[player1.name].setdefault(p1_result.type, 0)
+    #     status_counts[player1.name][p1_result.type] += 1
+
+    #     p2_result = result.player_result(2)
+    #     status_counts[player2.name].setdefault(p2_result.type, 0)
+    #     status_counts[player2.name][p2_result.type] += 1
+
+    #     if p1_result.type == "win":
+    #         outcome = 1.0
+    #     elif p1_result.type == "tie":
+    #         outcome = 0.5
+    #     else:
+    #         outcome = 0.0
+
+    #     newA, newB = update_elo(rA, rB, outcome, K=32)
+    #     ratings[player1.name], ratings[player2.name] = newA, newB
+    #     # Record after each match
+    #     for m in [player1.name, player2.name]:
+    #         history[m].append(ratings[m])
+
+    # sorted_ratings = sorted(
+    #     [(rating, name) for name, rating in ratings.items()], reverse=True
+    # )
+    # for rating, name in sorted_ratings:
+    #     statuses = ", ".join(
+    #         f"{status}: {count}" for status, count in status_counts[name].items()
+    #     )
+    #     print(f"{name}: {rating:.2f} ELO ({statuses})")
+
+    # if not output:
+    #     return
+
+    # game_results = [
+    #     get_tournament_game_result(result, player1, player2).model_dump(mode="json")
+    #     for result, player1, player2 in results
+    # ]
 
     if not output:
         return
 
-    game_results = [
-        get_tournament_game_result(result, player1, player2).model_dump(mode="json")
-        for result, player1, player2 in results
-    ]
-
-    final_result = {"ratings": ratings, "games": game_results}
+    final_result = TournamentResult(stats=models, games=game_results)
 
     with open(output, "w+") as f:
-        json.dump(final_result, f, indent=2)
+        json.dump(final_result.model_dump(mode="json"), f, indent=2)
 
     print("Output saved to", output)
+
+
+@cli.command()
+@click.argument("tournaments", nargs=-1)
+def tournament_stats(tournaments: list[str]) -> None:
+    games: list[TournamentGameResult] = []
+    for path in tournaments:
+        with open(path) as f:
+            data = json.load(f)
+        result = TournamentResult.model_validate(data)
+        games.extend(result.games)
+
+    models = compute_tournament_ratings(games)
+
+    print_model_stats(models)
 
 
 if __name__ == "__main__":

@@ -298,19 +298,34 @@ def compute_cost(usage: dict[str, dict[str, Any]]) -> float | None:
 
 class UsageTracker:
     def __init__(self) -> None:
-        self.models: dict[str, dict[str, Any]] = {}
+        self.models: dict[str, dict[str, int]] = {}
+        self.default_usage = {
+            "count": 0,
+            "total": 0,
+            "input": 0,
+            "output": 0,
+            "cached_input": 0,
+        }
 
     def log(
         self, model: str, total: int, input: int, output: int, cached_input: int = 0
     ) -> None:
-        self.models.setdefault(
-            model, {"count": 0, "total": 0, "input": 0, "output": 0, "cached_input": 0}
-        )
+        self.models.setdefault(model, self.default_usage.copy())
         self.models[model]["count"] += 1
         self.models[model]["total"] += total
         self.models[model]["input"] += input
         self.models[model]["output"] += output
         self.models[model]["cached_input"] += cached_input
+
+    def get(self, model: str) -> dict[str, int]:
+        return self.models.get(model, self.default_usage.copy())
+
+    def total(self) -> dict[str, int]:
+        usage = self.default_usage.copy()
+        for _, counts in self.models.items():
+            for key, val in counts.items():
+                usage[key] += val
+        return usage
 
     def cost(self) -> float | None:
         return compute_cost(self.models)
