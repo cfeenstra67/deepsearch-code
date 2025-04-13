@@ -4,13 +4,11 @@ import contextlib
 import dataclasses as dc
 import itertools
 import json
-import os
 import random
 import statistics
 import time
 import traceback
 from datetime import datetime
-from functools import wraps
 from typing import Any, Callable, Literal, cast
 
 import click
@@ -19,6 +17,8 @@ from pydantic import BaseModel, Field
 from tqdm.auto import tqdm
 
 from deepsearch_code import core
+from deepsearch_code.click import async_command
+from deepsearch_code.openrouter import get_openrouter_client
 
 
 class TicTacToeMove(BaseModel):
@@ -155,7 +155,7 @@ What's your next move?
     ):
         agents = [player1, player2]
 
-        run_kwargs = {
+        run_kwargs: Any = {
             "response_name": "play",
             "response_description": "Make your next move",
         }
@@ -551,20 +551,6 @@ def cli():
     pass
 
 
-def async_command(
-    group: click.Group, **kws
-) -> Callable[[Callable[..., Any]], click.Command]:
-    def dec(f):
-        @group.command(**kws)
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            return asyncio.run(f(*args, **kwargs))
-
-        return wrapper
-
-    return dec
-
-
 def parse_model_name(model_name: str) -> tuple[str, str]:
     parts = model_name.rsplit("::", 1)
     if len(parts) == 1:
@@ -636,7 +622,7 @@ async def play_games(
     concurrency: int | None = None,
     show_progress: bool = True,
     roll_die: bool = True,
-) -> list[tuple[GameResult, NamedOracle, NamedOracle]]:
+):
     semaphore: asyncio.Semaphore | None = None
     if concurrency is not None:
         semaphore = asyncio.Semaphore(concurrency)
@@ -653,24 +639,13 @@ async def play_games(
     progress = tqdm(total=len(tasks)) if show_progress else None
 
     pending = set(tasks)
-    out_games: list[tuple[GameResult, NamedOracle, NamedOracle]] = []
     while pending:
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             if progress is not None:
                 progress.update(1)
             model1, model2 = tasks[task]
-            out_games.append((task.result(), model1, model2))
-
-    return out_games
-
-
-def get_openai_client() -> openai.AsyncOpenAI:
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if api_key is None:
-        raise ValueError("OPENROUTER_API_KEY must be set")
-
-    return openai.AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+            yield task.result(), model1, model2
 
 
 @async_command(cli)
@@ -689,7 +664,7 @@ async def bench(
     if write and append:
         raise click.BadArgumentUsage("--write and --append cannot be used together")
 
-    client = get_openai_client()
+    client = get_openrouter_client()
 
     games: list[tuple[TicTacToe, NamedOracle, NamedOracle]] = []
     size = 3
@@ -701,7 +676,9 @@ async def bench(
 
             games.append((game, llm, minimax))
 
-    results = await play_games(games, concurrency=concurrency)
+    results: list[tuple[GameResult, NamedOracle, NamedOracle]] = []
+    async for game_result in play_games(games, concurrency=concurrency):
+        results.append(game_result)
     llm_results = [(game.player_result(1), model) for game, model, _ in results]
 
     metrics = compute_metrics(llm_results)
@@ -733,7 +710,7 @@ async def bench(
 async def play(player1: str, player2: str) -> None:
     size = 3
     game = TicTacToe(size)
-    client = get_openai_client()
+    client = get_openrouter_client()
 
     player1_oracle = create_oracle(player1, client, game, 1, allow_manual=True)
     player2_oracle = create_oracle(player2, client, game, 2, allow_manual=True)
@@ -889,7 +866,17 @@ def print_model_stats(stats: list[ModelStats]) -> None:
         statuses = ", ".join(
             f"{status}: {count}" for status, count in model_stats.status_counts.items()
         )
-        print(f"{model_stats.model}: {model_stats.rating:.2f} ELO ({statuses})")
+        input = model_stats.usage["input"] / model_stats.count
+        output = model_stats.usage["output"] / model_stats.count
+        cached_input = model_stats.usage["cached_input"] / model_stats.count
+        final = " ".join(
+            [
+                f"{model_stats.model}: {model_stats.rating:.2f} ELO",
+                f"({statuses})",
+                f"(avg {input=:.1f}, {output=:.1f} {cached_input=:.1f} tokens)",
+            ]
+        )
+        print(final)
 
 
 class TournamentResult(BaseModel):
@@ -904,7 +891,7 @@ class TournamentResult(BaseModel):
 async def tournament(
     model: list[str], output: str | None, concurrency: int | None
 ) -> None:
-    client = get_openai_client()
+    client = get_openrouter_client()
 
     games: list[tuple[TicTacToe, NamedOracle, NamedOracle]] = []
     for model1, model2 in itertools.permutations(model, 2):
@@ -913,27 +900,32 @@ async def tournament(
         oracle2 = create_oracle(model2, client, game, 2)
         games.append((game, oracle1, oracle2))
 
-    results = await play_games(games, concurrency=concurrency, roll_die=False)
+    results: list[tuple[GameResult, NamedOracle, NamedOracle]] = []
+    try:
+        async for game_result in play_games(
+            games, concurrency=concurrency, roll_die=False
+        ):
+            results.append(game_result)
+    finally:
+        game_results = [
+            get_tournament_game_result(result, player1, player2)
+            for result, player1, player2 in results
+        ]
+        game_results.sort(key=lambda x: x.timestamp)
 
-    game_results = [
-        get_tournament_game_result(result, player1, player2)
-        for result, player1, player2 in results
-    ]
-    game_results.sort(key=lambda x: x.timestamp)
+        models = compute_tournament_stats(game_results)
 
-    models = compute_tournament_stats(game_results)
+        print_model_stats(models)
 
-    print_model_stats(models)
+        if not output:
+            return
 
-    if not output:
-        return
+        final_result = TournamentResult(stats=models, games=game_results)
 
-    final_result = TournamentResult(stats=models, games=game_results)
+        with open(output, "w+") as f:
+            json.dump(final_result.model_dump(mode="json"), f, indent=2)
 
-    with open(output, "w+") as f:
-        json.dump(final_result.model_dump(mode="json"), f, indent=2)
-
-    print("Output saved to", output)
+        print("Output saved to", output)
 
 
 @cli.command()

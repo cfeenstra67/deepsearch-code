@@ -605,13 +605,15 @@ class LLMOracle(Oracle):
         tools_str = "\n\n".join(tool_strs)
 
         return f"""
+<response-instructions>
 First respond by thinking deeply about your next move, making observations, and spelling out your reasoning for your final decision. Then you must provide the tool that you'd like to call next to continue. The tools available to you are as follows:
 {tools_str}
 
-Each time you send a response, you must choose exactly one tool to call to continue. Your tool call should always be within your message and formatted as follows. The body of the `tool` tag MUST be provided a JSON object, and it must match the JSON schema provided in the corresponding tool's description above:
+Each time you send a response, you must choose exactly one tool to call to continue. Your tool call should always be within your message and formatted as an XML tag as follows. The body of the `tool` tag MUST be provided a JSON object, and it must match the JSON schema provided in the corresponding tool's description above:
 <tool name="example_tool_name">
 {{"some_field": "some_value"}}
 </tool>
+</response-instructions>
 """.strip()
 
     async def ask(
@@ -671,7 +673,7 @@ Each time you send a response, you must choose exactly one tool to call to conti
                     {
                         "role": "user",
                         "content": f"""
-You didn't provide a valid tool call in your response. Remember, your response must include a tool call formatted as follows:
+You didn't provide a valid tool call in your response. Remember, your response must include exactly one tool call formatted as an XML tag as follows:
 <tool name="example_tool_name">
 {{"some_field": "some_value"}}
 </tool>
@@ -712,9 +714,12 @@ You have {self.allowed_attempts - failures} attempt(s) remaining.
                 )
                 continue
 
-            print("????", repr(tool_name), tools_by_name)
+            print(
+                "????", repr(tool_name), list(tools_by_name), tool_name in tools_by_name
+            )
 
             if tool_name not in tools_by_name:
+                print("INVALID TOOL", tool_name, tool_name not in tools_by_name)
                 failures += 1
                 available_tools = ", ".join(list(tools_by_name))
                 message_dicts.append(
@@ -739,6 +744,7 @@ You have {self.allowed_attempts - failures} attempt(s) remaining.
                 error = json.dumps(err.errors())
 
             if error:
+                print("VALLIDATION ERROR", error)
                 failures += 1
                 available_tools = ", ".join(list(tools_by_name))
                 message_dicts.append(

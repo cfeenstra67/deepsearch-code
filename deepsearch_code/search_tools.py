@@ -87,7 +87,7 @@ class ScrollableString:
 
 
 class Shell:
-    def __init__(self, cwd: str = ".", line_limit: int = 100) -> None:
+    def __init__(self, cwd: str = ".", line_limit: int = 500) -> None:
         self.cwd = cwd
         self.line_limit = line_limit
 
@@ -145,10 +145,25 @@ def find_tool(shell: Shell) -> core.Tool:
     return find
 
 
+def tree_tool(shell: Shell) -> core.Tool:
+    @core.tool
+    async def tree(cmd_args: list[str]) -> tuple[str, list[core.Tool]]:
+        """
+        The `tree` command line tool for viewing directory structure. No arguments are required, in which case you'll receive the entire directory structure of the repository. You can pass a path to see the directory structure of that path. Key options:
+        - -L level - Max display depth of the directory tree.
+        - -a - All files are printed.  By default tree does not print hidden files (those beginning with a dot `.')
+        Example: ["src", "-L", "2"]
+        """
+        return await run_tool_command("tree", cmd_args, shell)
+
+    return tree
+
+
 class ReadFileArgs(BaseModel):
     path: str = Field(description="Relative path to a file")
     line_number: int | None = Field(
-        description="Optional line number to start on. You'll be able to scroll up and down as needed to view more of the file."
+        default=None,
+        description="Optional line number to start on. You'll be able to scroll up and down as needed to view more of the file.",
     )
 
 

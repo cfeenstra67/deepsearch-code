@@ -45,33 +45,34 @@ class AgentLogger:
         core.agent_created.connect(self.agent_created)
 
 
-class ExpectedOutput(core.Plugin):
+class ExpectedOutput:
     def __init__(self) -> None:
         self.expected_output: str | None = None
 
     def prompt(self) -> core.Prompt:
         def get_message():
-            lines = ["## Expected Research Output Structure", ""]
+            lines = ["<expected-research-output-structure>"]
             if self.expected_output is None:
                 lines.append(
-                    "You haven't set an expectation of how the output should be structured yet. Use the update_expected_output tool to do so."
+                    "You haven't set an expectation of how the output should be structured yet. Use the update_expected_output_structure tool to do so."
                 )
             else:
                 lines.append(self.expected_output)
+            lines.append("</expected-research-output-structure>")
             return "\n".join(lines)
 
         return core.FunctionPrompt(get_message)
 
-    def tools(self) -> list[core.Tool]:
+    def update_tool(self) -> core.Tool:
         @core.tool
-        def update_expected_output(new_expected_output: str) -> str:
+        def update_expected_output_structure(new_expected_output: str) -> str:
             """
-            Update the expected outpu structure to match your expectations based on the information now available to you. This will replace the existing expectations, so take care to avoid regressions.
+            Update the expected output structure to match your expectations based on the information now available to you. This will replace the existing expectations, so take care to avoid regressions.
             """
             if self.expected_output is None:
                 response = "The expected output structure has been set"
             else:
-                diff = difflib.ndiff(
+                diff = difflib.unified_diff(
                     self.expected_output.splitlines(keepends=True),
                     new_expected_output.splitlines(keepends=True),
                 )
@@ -82,39 +83,40 @@ class ExpectedOutput(core.Plugin):
 
             return response
 
-        return [update_expected_output]
-
-    def clone(self) -> "ExpectedOutput":
-        return ExpectedOutput()
+        return update_expected_output_structure
 
 
-class ResearchTeam(core.Plugin):
-    def __init__(self, search_agent: core.Agent) -> None:
-        self.search_agent = search_agent
+class ResearchQuestions:
+    def __init__(self) -> None:
         self.questions: dict[str, str] = {}
 
     def prompt(self) -> core.Prompt:
         def get_message():
-            lines = ["## Research Questions", ""]
+            lines = ["<answered-questions>"]
             if not self.questions:
                 lines.append("You haven't posed any questions for your team yet")
             else:
                 for question, answer in self.questions.items():
-                    lines.append(f"### {question}")
+                    lines.append("<question>")
+                    lines.append(question)
+                    lines.append("<answer>")
                     lines.append(answer)
-                    lines.append("")
+                    lines.append("</answer>")
+                    lines.append("</question>")
+
+            lines.append("</answered-questions>")
 
             return "\n".join(lines)
 
         return core.FunctionPrompt(get_message)
 
-    def tools(self) -> list[core.Tool]:
+    def research_tool(self, search_agent: core.Agent) -> core.Tool:
         @core.tool
         async def research_question(question: str):
             """
             Ask a question for your team of researchers to try to answer from the repository
             """
-            agent = self.search_agent.clone()
+            agent = search_agent.clone()
 
             response = await agent.run(question)
 
@@ -132,20 +134,19 @@ class ResearchTeam(core.Plugin):
 
             return f"The team responded with:\n{response.answer}", [request_changes]
 
-        return [research_question]
-
-    def clone(self) -> "ResearchTeam":
-        return ResearchTeam(self.search_agent)
+        return research_question
 
 
-def search_agent(repo: str, oracle: core.Oracle) -> core.Agent:
+def search_agent(
+    repo: str, oracle: core.Oracle, questions: ResearchQuestions
+) -> core.Agent:
     conversation = core.Conversation(oracle)
 
     prompt = core.StringPrompt(
         f"""
 You are a seasoned researcher who thinks deeply, synthesizes large amounts of information and produces comprehensive and precise yet concise responses. Responses should be a long as needed to answer the user's question and no more.
 
-You'll be researching the following repository: {repo}. In order to answer questions about it, you'll have the ability to read files and search files within the repository, and you'll have to piece together your answer based on the content of the repository. Even if you think you already know the answer, you should find code that confirms your intuitions.
+You'll be researching the following repository: {repo}. In order to answer questions about it, you'll have the ability to read files and search files within the repository, and you'll have to piece together your answer based on the content of the repository. Even if you think you already know the answer, you should find code that confirms your priors.
 
 In your response, please include key links to files within the repository as markdown links, using relative paths from the repository root, optionally with line numbers or ranges in the hash parameter. [for example](README.md#L112-L145)
 """.strip()
@@ -156,15 +157,21 @@ In your response, please include key links to files within the repository as mar
     shell = search_tools.Shell(repo_path)
     ripgrep = search_tools.ripgrep_tool(shell)
     find = search_tools.find_tool(shell)
+    tree = search_tools.tree_tool(shell)
     read_file = search_tools.read_file_tool(shell)
 
     return core.BasicAgent(
-        conversation, prompt=prompt, tools=[find, ripgrep, read_file]
+        conversation,
+        prompt=core.Prompts([prompt, questions.prompt()]),
+        tools=[find, tree, ripgrep, read_file],
     )
 
 
 def manager_agent(
-    repo: str, oracle: core.Oracle, search_agent: core.Agent
+    repo: str,
+    oracle: core.Oracle,
+    questions: ResearchQuestions,
+    search_agent: core.Agent,
 ) -> core.Agent:
     conversation = core.Conversation(oracle)
 
@@ -177,9 +184,12 @@ In your response, please include key links to files within the repository as mar
     )
 
     expected_output = ExpectedOutput()
-    team = ResearchTeam(search_agent)
 
-    return core.BasicAgent(conversation, prompt=prompt, plugins=[expected_output, team])
+    return core.BasicAgent(
+        conversation,
+        prompt=core.Prompts([prompt, expected_output.prompt(), questions.prompt()]),
+        tools=[expected_output.update_tool(), questions.research_tool(search_agent)],
+    )
 
 
 @async_command(cli)
@@ -188,7 +198,7 @@ In your response, please include key links to files within the repository as mar
 @click.option("--download", is_flag=True)
 @click.option("--repl", is_flag=True)
 @click.option("-o", "--output", default=None)
-@click.option("-m", "--model", default="deepseek/deepseek-r1")
+@click.option("-m", "--model", default="google/gemini-2.5-pro-preview-03-25")
 async def search(
     repo: str, question: str, download: bool, repl: bool, output: str | None, model: str
 ) -> None:
@@ -219,9 +229,11 @@ async def search(
     logger = AgentLogger()
     logger.bind_all()
 
-    search = search_agent(repo, oracle)
+    questions = ResearchQuestions()
 
-    manager = manager_agent(repo, oracle, search)
+    search = search_agent(repo, oracle, questions)
+
+    manager = manager_agent(repo, oracle, questions, search)
 
     response = await manager.run(question)
 
