@@ -16,7 +16,7 @@ import openai
 from pydantic import BaseModel, Field
 from tqdm.auto import tqdm
 
-from deepsearch_code import core
+from deepsearch_code import core, oracles
 from deepsearch_code.openrouter import get_openrouter_client
 from deepsearch_code.utils import async_command
 
@@ -565,21 +565,26 @@ def parse_model_name(model_name: str) -> tuple[str, str]:
 class NamedOracle:
     name: str
     oracle: core.Oracle
-    tracker: core.UsageTracker
+    tracker: oracles.UsageTracker
     meta: dict[str, Any]
 
 
 def create_llm_oracle(
-    model_name: str, method: str, client: openai.AsyncOpenAI, tracker: core.UsageTracker
+    model_name: str,
+    method: str,
+    client: openai.AsyncOpenAI,
+    tracker: oracles.UsageTracker,
 ) -> core.Oracle:
     if method == "text":
-        return core.LLMOracle(model=model_name, client=client, tracker=tracker)
+        return oracles.LLMOracle(model=model_name, client=client, tracker=tracker)
     if method == "structured_outputs":
-        return core.LLMStructuredOutputsOracle(
+        return oracles.LLMStructuredOutputsOracle(
             model=model_name, client=client, tracker=tracker
         )
     if method == "tools":
-        return core.LLMToolUseOracle(model=model_name, client=client, tracker=tracker)
+        return oracles.LLMToolUseOracle(
+            model=model_name, client=client, tracker=tracker
+        )
     raise ValueError(f"Invalid method: '{method}'")
 
 
@@ -591,11 +596,11 @@ def create_oracle(
     allow_manual: bool = False,
     allow_minimax: bool = True,
 ) -> NamedOracle:
-    tracker = core.UsageTracker()
+    tracker = oracles.UsageTracker()
 
     if name == "me" and allow_manual:
         return NamedOracle(
-            name=name, oracle=core.ReplOracle(), tracker=tracker, meta={}
+            name=name, oracle=oracles.ReplOracle(), tracker=tracker, meta={}
         )
     if name == "minimax" and allow_minimax:
         return NamedOracle(

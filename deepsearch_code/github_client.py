@@ -1,24 +1,24 @@
 import contextlib
+import os
 
 import aiofiles
 import aiohttp
 
-from . import settings
-
 
 @contextlib.asynccontextmanager
 async def github_client_session():
+    token = os.getenv("GITHUB_TOKEN")
+
     """Creates or returns a global aiohttp ClientSession."""
     headers = {
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    if settings.GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {settings.GITHUB_TOKEN}"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
-    timeout = aiohttp.ClientTimeout(total=settings.REQUESTS_TIMEOUT)
     async with aiohttp.ClientSession(
-        headers=headers, timeout=timeout, base_url=settings.GITHUB_API_URL
+        headers=headers, base_url="https://api.github.com"
     ) as session:
         yield session
 

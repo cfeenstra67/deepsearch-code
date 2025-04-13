@@ -191,8 +191,8 @@ def read_file_tool(shell: Shell) -> core.Tool:
 
 
 class ExpectedOutput:
-    def __init__(self) -> None:
-        self.expected_output: str | None = None
+    def __init__(self, expected_output: str | None = None) -> None:
+        self.expected_output = expected_output
 
     def prompt(self) -> core.Prompt:
         def get_message():
@@ -232,8 +232,10 @@ class ExpectedOutput:
 
 
 class ResearchQuestions:
-    def __init__(self) -> None:
-        self.questions: dict[str, str] = {}
+    def __init__(self, questions: dict[str, str] | None = None) -> None:
+        if questions is None:
+            questions = {}
+        self.questions = questions
 
     def prompt(self) -> core.Prompt:
         def get_message():

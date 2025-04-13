@@ -1,15 +1,13 @@
 #!/usr/bin/env -S uv run python
-import difflib
 import os
 import shutil
 
 import click
 
-from deepsearch_code import core, search_tools
-from deepsearch_code.click import async_command
+from deepsearch_code import core, oracles, search_tools
 from deepsearch_code.download import download_repo
-from deepsearch_code.logging import setup_logging
 from deepsearch_code.openrouter import get_openrouter_client
+from deepsearch_code.utils import async_command, setup_logging
 
 REPOS_DIR = ".repos"
 
@@ -19,126 +17,24 @@ def cli():
     pass
 
 
-class AgentLogger:
+class ToolStats:
     def __init__(self) -> None:
         self.tool_calls: dict[str, int] = {}
+        core.agent_created.connect(self.agent_created)
 
     def agent_created(self, agent):
-        print("Agent created", agent)
         self.bind(agent)
 
-    async def agent_responded(self, sender, raw, tool, args):
-        print("Agent response:\n", raw.content)
-
     async def tool_called(self, sender, tool, args, response):
-        print(
-            f"Tool response for {tool.name()} with {args!r}:\n{tool.format(response)}"
-        )
         self.tool_calls.setdefault(tool.name(), 0)
         self.tool_calls[tool.name()] += 1
 
     def bind(self, agent: core.Agent) -> None:
-        core.agent_responded.connect(self.agent_responded, sender=agent)
         core.tool_called.connect(self.tool_called, sender=agent)
-
-    def bind_all(self) -> None:
-        core.agent_created.connect(self.agent_created)
-
-
-class ExpectedOutput:
-    def __init__(self) -> None:
-        self.expected_output: str | None = None
-
-    def prompt(self) -> core.Prompt:
-        def get_message():
-            lines = ["<expected-research-output-structure>"]
-            if self.expected_output is None:
-                lines.append(
-                    "You haven't set an expectation of how the output should be structured yet. Use the update_expected_output_structure tool to do so."
-                )
-            else:
-                lines.append(self.expected_output)
-            lines.append("</expected-research-output-structure>")
-            return "\n".join(lines)
-
-        return core.FunctionPrompt(get_message)
-
-    def update_tool(self) -> core.Tool:
-        @core.tool
-        def update_expected_output_structure(new_expected_output: str) -> str:
-            """
-            Update the expected output structure to match your expectations based on the information now available to you. This will replace the existing expectations, so take care to avoid regressions.
-            """
-            if self.expected_output is None:
-                response = "The expected output structure has been set"
-            else:
-                diff = difflib.unified_diff(
-                    self.expected_output.splitlines(keepends=True),
-                    new_expected_output.splitlines(keepends=True),
-                )
-                diff_txt = "".join(diff)
-                response = f"The expected output structure has been updated. Diff from previous:\n{diff_txt or '<none>'}"
-
-            self.expected_output = new_expected_output
-
-            return response
-
-        return update_expected_output_structure
-
-
-class ResearchQuestions:
-    def __init__(self) -> None:
-        self.questions: dict[str, str] = {}
-
-    def prompt(self) -> core.Prompt:
-        def get_message():
-            lines = ["<answered-questions>"]
-            if not self.questions:
-                lines.append("You haven't posed any questions for your team yet")
-            else:
-                for question, answer in self.questions.items():
-                    lines.append("<question>")
-                    lines.append(question)
-                    lines.append("<answer>")
-                    lines.append(answer)
-                    lines.append("</answer>")
-                    lines.append("</question>")
-
-            lines.append("</answered-questions>")
-
-            return "\n".join(lines)
-
-        return core.FunctionPrompt(get_message)
-
-    def research_tool(self, search_agent: core.Agent) -> core.Tool:
-        @core.tool
-        async def research_question(question: str):
-            """
-            Ask a question for your team of researchers to try to answer from the repository
-            """
-            agent = search_agent.clone()
-
-            response = await agent.run(question)
-
-            @core.tool
-            async def request_changes(changes: str):
-                """
-                Request changes to the previous response from research_question
-                """
-                response = await agent.run(
-                    f"The following changes were requested:\n{changes}"
-                )
-                return response.answer, [request_changes]
-
-            self.questions[question] = response.answer
-
-            return f"The team responded with:\n{response.answer}", [request_changes]
-
-        return research_question
 
 
 def search_agent(
-    repo: str, oracle: core.Oracle, questions: ResearchQuestions
+    repo: str, oracle: core.Oracle, questions: search_tools.ResearchQuestions
 ) -> core.Agent:
     conversation = core.Conversation(oracle)
 
@@ -170,7 +66,7 @@ In your response, please include key links to files within the repository as mar
 def manager_agent(
     repo: str,
     oracle: core.Oracle,
-    questions: ResearchQuestions,
+    questions: search_tools.ResearchQuestions,
     search_agent: core.Agent,
 ) -> core.Agent:
     conversation = core.Conversation(oracle)
@@ -183,7 +79,7 @@ In your response, please include key links to files within the repository as mar
 """.strip()
     )
 
-    expected_output = ExpectedOutput()
+    expected_output = search_tools.ExpectedOutput()
 
     return core.BasicAgent(
         conversation,
@@ -215,21 +111,20 @@ async def search(
         print("Already downloaded", repo)
 
     client = get_openrouter_client()
-    tracker = core.UsageTracker()
+    tracker = oracles.UsageTracker()
     oracle: core.Oracle
     if repl:
-        oracle = core.ReplOracle()
+        oracle = oracles.ReplOracle()
     else:
-        oracle = core.LLMOracle(
+        oracle = oracles.LLMOracle(
             model=model,
             client=client,
             tracker=tracker,
         )
 
-    logger = AgentLogger()
-    logger.bind_all()
+    stats = ToolStats()
 
-    questions = ResearchQuestions()
+    questions = search_tools.ResearchQuestions()
 
     search = search_agent(repo, oracle, questions)
 
@@ -238,7 +133,7 @@ async def search(
     response = await manager.run(question)
 
     print("USAGE", tracker.total())
-    print("TOOL CALLS", logger.tool_calls)
+    print("TOOL CALLS", stats.tool_calls)
     print("RESPONSE", response.answer)
 
     if output:

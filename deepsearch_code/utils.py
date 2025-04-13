@@ -1,5 +1,10 @@
-from typing import Any, Type
+import asyncio
+import os
+from functools import wraps
+from logging.config import dictConfig
+from typing import Any, Callable, Type
 
+import click
 from pydantic import BaseModel
 
 
@@ -75,3 +80,48 @@ def get_resolved_pydantic_schema(model: Type[BaseModel]) -> dict[str, Any]:
     definitions = schema.pop("$defs", {})
     resolved = resolve_pydantic_schema(schema, definitions)
     return trim_pydantic_schema(resolved)
+
+
+def async_command(
+    group: click.Group, **kws
+) -> Callable[[Callable[..., Any]], click.Command]:
+    def dec(f):
+        @group.command(**kws)
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            return asyncio.run(f(*args, **kwargs))
+
+        return wrapper
+
+    return dec
+
+
+def setup_logging(level: str | None = None) -> None:
+    if level is None:
+        level = os.getenv("LOG_LEVEL", "ERROR")
+    dictConfig(
+        {
+            "version": 1,
+            "formatters": {
+                "main": {"format": "%(asctime)s - %(name)s [%(levelname)s] %(message)s"}
+            },
+            "handlers": {
+                "console": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "main",
+                },
+            },
+            "loggers": {
+                "deepsearch_code": {
+                    "level": level,
+                    "handlers": ["console"],
+                    "propagate": False,
+                },
+                "__main__": {
+                    "level": level,
+                    "handlers": ["console"],
+                    "propagate": False,
+                },
+            },
+        }
+    )
