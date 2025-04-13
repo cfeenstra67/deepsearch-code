@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import os
 import tempfile
 
@@ -187,3 +188,95 @@ def read_file_tool(shell: Shell) -> core.Tool:
             return f"File not found: {path}", []
 
     return core.tool(read_file, input_schema=ReadFileArgs)
+
+
+class ExpectedOutput:
+    def __init__(self) -> None:
+        self.expected_output: str | None = None
+
+    def prompt(self) -> core.Prompt:
+        def get_message():
+            lines = ["<expected-research-output-structure>"]
+            if self.expected_output is None:
+                lines.append(
+                    "You haven't set an expectation of how the output should be structured yet. Use the update_expected_output_structure tool to do so."
+                )
+            else:
+                lines.append(self.expected_output)
+            lines.append("</expected-research-output-structure>")
+            return "\n".join(lines)
+
+        return core.FunctionPrompt(get_message)
+
+    def update_tool(self) -> core.Tool:
+        @core.tool
+        def update_expected_output_structure(new_expected_output: str) -> str:
+            """
+            Update the expected output structure to match your expectations based on the information now available to you. This will replace the existing expectations, so take care to avoid regressions.
+            """
+            if self.expected_output is None:
+                response = "The expected output structure has been set"
+            else:
+                diff = difflib.unified_diff(
+                    self.expected_output.splitlines(keepends=True),
+                    new_expected_output.splitlines(keepends=True),
+                )
+                diff_txt = "".join(diff)
+                response = f"The expected output structure has been updated. Diff from previous:\n{diff_txt or '<none>'}"
+
+            self.expected_output = new_expected_output
+
+            return response
+
+        return update_expected_output_structure
+
+
+class ResearchQuestions:
+    def __init__(self) -> None:
+        self.questions: dict[str, str] = {}
+
+    def prompt(self) -> core.Prompt:
+        def get_message():
+            lines = ["<answered-questions>"]
+            if not self.questions:
+                lines.append("You haven't posed any questions for your team yet")
+            else:
+                for question, answer in self.questions.items():
+                    lines.append("<question>")
+                    lines.append(question)
+                    lines.append("<answer>")
+                    lines.append(answer)
+                    lines.append("</answer>")
+                    lines.append("</question>")
+
+            lines.append("</answered-questions>")
+
+            return "\n".join(lines)
+
+        return core.FunctionPrompt(get_message)
+
+    def research_tool(self, search_agent: core.Agent) -> core.Tool:
+        @core.tool
+        async def research_question(question: str):
+            """
+            Ask a question for your team of researchers to try to answer from the repository
+            """
+            agent = search_agent.clone()
+
+            response = await agent.run(question)
+
+            @core.tool
+            async def request_changes(changes: str):
+                """
+                Request changes to the previous response from research_question
+                """
+                response = await agent.run(
+                    f"The following changes were requested:\n{changes}"
+                )
+                return response.answer, [request_changes]
+
+            self.questions[question] = response.answer
+
+            return f"The team responded with:\n{response.answer}", [request_changes]
+
+        return research_question

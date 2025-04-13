@@ -17,8 +17,8 @@ from pydantic import BaseModel, Field
 from tqdm.auto import tqdm
 
 from deepsearch_code import core
-from deepsearch_code.click import async_command
 from deepsearch_code.openrouter import get_openrouter_client
+from deepsearch_code.utils import async_command
 
 
 class TicTacToeMove(BaseModel):
