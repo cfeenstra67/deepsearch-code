@@ -113,12 +113,12 @@ def setup_logging(level: str | None = None) -> None:
             },
             "loggers": {
                 "deepsearch_code": {
-                    "level": level,
+                    "level": level.upper(),
                     "handlers": ["console"],
                     "propagate": False,
                 },
                 "__main__": {
-                    "level": level,
+                    "level": level.upper(),
                     "handlers": ["console"],
                     "propagate": False,
                 },

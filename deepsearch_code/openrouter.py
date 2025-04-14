@@ -5,7 +5,7 @@ import openai
 
 def get_openrouter_client() -> openai.AsyncOpenAI:
     api_key = os.getenv("OPENROUTER_API_KEY")
-    if api_key is None:
+    if not api_key:
         raise ValueError("OPENROUTER_API_KEY must be set")
 
     return openai.AsyncOpenAI(
