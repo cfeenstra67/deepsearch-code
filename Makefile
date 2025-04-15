@@ -1,8 +1,11 @@
+
+SRC=deepsearch_code
+
 fmt:
-	uv run ruff format deepsearch_code *.py
-	uv run ruff check --fix deepsearch_code *.py
+	uv run ruff format $(SRC)
+	uv run ruff check --fix $(SRC)
 
 check:
-	uv run ruff format --check deepsearch_code *.py
-	uv run ruff check deepsearch_code *.py
-	uv run mypy deepsearch_code *.py
+	uv run ruff format --check $(SRC)
+	uv run ruff check $(SRC)
+	uv run mypy $(SRC)

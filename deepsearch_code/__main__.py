@@ -1,4 +1,3 @@
-#!/usr/bin/env -S uv run python
 import json
 import os
 import shutil
