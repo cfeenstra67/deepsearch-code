@@ -19,6 +19,9 @@ dependencies = [
     "tqdm>=4.67.1",
 ]
 
+[project.scripts]
+deepsearch-code = "deepsearch_code.__main__:cli"
+
 [dependency-groups]
 dev = [
     "jupyterlab>=4.4.0",
