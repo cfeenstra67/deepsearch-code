@@ -181,7 +181,18 @@ async def search(
     setup_logging()
 
     if sum([repo is not None, path is not None, input is not None]) > 1:
-        raise click.BadArgumentUsage("Only one of --repo, --path, or --input may be specified")
+        raise click.BadArgumentUsage(
+            "Only one of --repo, --path, or --input may be specified"
+        )
+
+    if model is None and researcher_model is None:
+        researcher_model = "google/gemini-2.0-flash-001"
+    if model is None:
+        model = "google/gemini-2.5-pro-preview-03-25"
+    if manager_model is None:
+        manager_model = model
+    if researcher_model is None:
+        researcher_model = model
 
     existing: ResearchConversation | None = None
     repo_name: str
@@ -190,10 +201,6 @@ async def search(
         with open(input) as f:
             json_data = json.load(f)
         existing = ResearchConversation.model_validate(json_data)
-        if existing.repo != repo:
-            raise click.Abort(
-                f"The conversation at {input} is about {existing.repo}, not {repo}"
-            )
         repo_name = existing.repo_name
         repo_path = existing.repo_path
     elif repo is not None:
@@ -236,7 +243,7 @@ async def search(
         manager_oracle, existing.manager_messages if existing is not None else None
     )
 
-    manager = manager_agent(repo, manager_convo, questions, search)
+    manager = manager_agent(repo_name, manager_convo, questions, search)
 
     start = time.time()
 
