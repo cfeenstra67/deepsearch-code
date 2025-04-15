@@ -159,7 +159,6 @@ async def maybe_download_repo(repo: str) -> str:
 )
 @click.option(
     "--manager-model",
-    default="google/gemini-2.5-pro-preview-03-25",
     help="Model to use as the 'manager' which is responsible for the final response. This will use fewer tokens in most cases than researcher-model.",
 )
 @click.option(
@@ -251,7 +250,7 @@ async def search(
 
     elapsed = time.time() - start
 
-    print(response.answer)
+    print(response)
 
     print()
     print("Elapsed: ", readable_time(elapsed))
@@ -276,7 +275,7 @@ async def search(
         repo_name=repo_name,
         repo_path=repo_path,
         question=question,
-        answer=response.answer,
+        answer=response,
         research_questions=questions.questions,
         manager_messages=manager_convo.messages,
     )

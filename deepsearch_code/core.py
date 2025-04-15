@@ -21,7 +21,7 @@ from pydantic import BaseModel, create_model
 
 LOGGER = logging.getLogger(__name__)
 
-ToolInput = TypeVar("ToolInput", bound=BaseModel)
+ToolInput = TypeVar("ToolInput")
 
 ToolOutput = TypeVar("ToolOutput")
 
@@ -44,9 +44,8 @@ class Tool(Generic[ToolInput, ToolOutput], abc.ABC):
     def description(self) -> str:
         raise NotImplementedError
 
-    @abc.abstractmethod
-    def args(self) -> Type[ToolInput]:
-        raise NotImplementedError
+    def schema(self) -> Type[ToolInput] | None:
+        return None
 
     @abc.abstractmethod
     async def call(self, args: ToolInput) -> tuple[ToolOutput, list["Tool"]]:
@@ -62,7 +61,7 @@ class FunctionTool(Tool[ToolInput, ToolOutput]):
     func: Callable[[ToolInput], Awaitable[tuple[ToolOutput, list[Tool]]]]
     tool_name: str
     tool_description: str
-    tool_args: Type[ToolInput]
+    tool_schema: Type[ToolInput] | None
     tool_format: Callable[[ToolOutput], str]
 
     def name(self) -> str:
@@ -71,8 +70,8 @@ class FunctionTool(Tool[ToolInput, ToolOutput]):
     def description(self) -> str:
         return self.tool_description
 
-    def args(self) -> Type[ToolInput]:
-        return self.tool_args
+    def schema(self) -> Type[ToolInput] | None:
+        return self.tool_schema
 
     async def call(self, args: ToolInput) -> tuple[ToolOutput, list["Tool"]]:
         return await self.func(args)
@@ -87,8 +86,8 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     format: Callable[[ToolOutput], str] | None = None,
-    input_schema: Type[BaseModel] | None = None,
-) -> FunctionTool:
+    input_schema: Type[ToolInput] | None = None,
+) -> FunctionTool[ToolInput, ToolOutput]:
     if name is None:
         name = func.__name__
     if description is None:
@@ -113,10 +112,13 @@ def tool(
                 raise ValueError("Cannot use variable args w/ tool()")
             input_fields[param_name] = param_val.annotation
 
-        input_schema = create_model(f"{name}InputSchema", **input_fields)
+        if len(input_fields) != 1 or list(input_fields.values())[0] is not str:
+            input_schema = create_model(f"{name}InputSchema", **input_fields)
 
     async def wrapper(input):
-        result = func(**input.model_dump())
+        result = (
+            func(**input.model_dump()) if isinstance(input, BaseModel) else func(input)
+        )
         if inspect.isawaitable(result):
             result = await result
         if not isinstance(result, tuple):
@@ -127,7 +129,7 @@ def tool(
         wrapper,
         tool_name=name,
         tool_description=description,
-        tool_args=input_schema,
+        tool_schema=input_schema,
         tool_format=format,
     )
 
@@ -226,17 +228,9 @@ class Conversation:
         return raw, tool, args
 
 
-class AgentResponse(BaseModel):
-    answer: str
-
-
-AgentOutput = TypeVar("AgentOutput", bound=BaseModel, default=AgentResponse)
-
-
-class AgentRespond(Tool[AgentOutput, str]):
+class AgentRespond(Tool[str, str]):
     def __init__(
         self,
-        response_schema: Type[AgentOutput],
         name: str | None = None,
         description: str | None = None,
     ) -> None:
@@ -245,8 +239,7 @@ class AgentRespond(Tool[AgentOutput, str]):
         if description is None:
             description = "Confidently provide a response to your task"
 
-        self.response_schema = response_schema
-        self.response: AgentOutput | None = None
+        self.response: str | None = None
         self._name = name
         self._description = description
 
@@ -256,10 +249,7 @@ class AgentRespond(Tool[AgentOutput, str]):
     def description(self) -> str:
         return self._description
 
-    def args(self) -> Type[AgentOutput]:
-        return self.response_schema
-
-    async def call(self, args: AgentOutput) -> tuple[str, list[Tool]]:
+    async def call(self, args: str) -> tuple[str, list[Tool]]:
         self.response = args
         return "Your response has been recorded. You're done!", []
 
@@ -293,18 +283,13 @@ class Agent(abc.ABC):
         *,
         response_name: str | None = None,
         response_description: str | None = None,
-        response_schema: Type[AgentOutput] = AgentResponse,  # type: ignore
         tools: list[Tool] | None = None,
         plugins: list[Plugin] | None = None,
-    ) -> AgentOutput:
+    ) -> str:
         raise NotImplementedError
 
 
-class AgentInput(BaseModel):
-    question: str
-
-
-class AgentTool(Tool[AgentInput, AgentOutput]):
+class AgentTool(Tool[str, str]):
     def __init__(
         self,
         name: str,
@@ -335,23 +320,18 @@ class AgentTool(Tool[AgentInput, AgentOutput]):
     def description(self) -> str:
         return self._description
 
-    def args(self) -> Type[AgentInput]:
-        return AgentInput
-
-    async def call(self, args: AgentInput) -> tuple[AgentOutput, list[Tool]]:
-        question = self.question(args.question)
+    async def call(self, text: str) -> tuple[str, list[Tool]]:
+        question = self.question(text)
 
         agent = self.agent.clone(fork=self.fork)
 
-        response: AgentOutput = await agent.run(question)
+        response = await agent.run(question)
         tools = [tool(agent) for tool in self.tools]
 
         return response, tools
 
-    def format(self, output: AgentOutput) -> str:
-        if isinstance(output, AgentResponse):
-            return output.answer
-        return json.dumps(output.model_dump(mode="json"), indent=2)
+    def format(self, output: str) -> str:
+        return output
 
 
 def agent_tool(
@@ -360,7 +340,7 @@ def agent_tool(
     description: str,
     question: Callable[[str], str] | None = None,
     fork: bool = False,
-) -> Tool[AgentInput, AgentOutput]:
+) -> Tool[str, str]:
     tools: list[Callable[[Agent], Tool]] = []
     if not fork:
 
@@ -416,18 +396,15 @@ class BasicAgent(Agent):
         self,
         question: str,
         *,
-        response_schema: Type[AgentOutput] = AgentResponse,  # type: ignore
         response_name: str | None = None,
         response_description: str | None = None,
         tools: list[Tool] | None = None,
         plugins: list[Plugin] | None = None,
-    ) -> AgentOutput:
+    ) -> str:
         if tools is None:
             tools = []
 
-        respond = AgentRespond(
-            response_schema, name=response_name, description=response_description
-        )
+        respond = AgentRespond(name=response_name, description=response_description)
 
         all_plugins = self.plugins + (plugins or [])
         plugin_tools = [tool for p in all_plugins for tool in p.tools()]
@@ -443,7 +420,7 @@ class BasicAgent(Agent):
         prompt = Prompts(prompts)
 
         message = Message(role="user", content=question)
-        message_tools = all_tools
+        message_tools: list[Tool] = all_tools
 
         while respond.response is None:
             candidates = [tool for tool in message_tools if tool.enabled()]

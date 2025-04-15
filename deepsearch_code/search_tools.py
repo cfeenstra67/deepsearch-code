@@ -239,9 +239,9 @@ class ResearchQuestions:
 
     def prompt(self) -> core.Prompt:
         def get_message():
-            lines = ["<answered-questions>"]
+            lines = ["<past-research-questions>"]
             if not self.questions:
-                lines.append("You haven't posed any questions for your team yet")
+                lines.append("No research questions have been answered yet")
             else:
                 for question, answer in self.questions.items():
                     lines.append("<question>")
@@ -251,7 +251,7 @@ class ResearchQuestions:
                     lines.append("</answer>")
                     lines.append("</question>")
 
-            lines.append("</answered-questions>")
+            lines.append("</past-research-questions>")
 
             return "\n".join(lines)
 
@@ -275,10 +275,10 @@ class ResearchQuestions:
                 response = await agent.run(
                     f"The following changes were requested:\n{changes}"
                 )
-                return response.answer, [request_changes]
+                return response, [request_changes]
 
-            self.questions[question] = response.answer
+            self.questions[question] = response
 
-            return f"The team responded with:\n{response.answer}", [request_changes]
+            return f"The team responded with:\n{response}", [request_changes]
 
         return research_question
