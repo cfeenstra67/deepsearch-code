@@ -10,6 +10,7 @@ dependencies = [
     "aiohttp>=3.11.16",
     "aiosqlite>=0.21.0",
     "blinker>=1.9.0",
+    "click-default-group>=1.2.4",
     "click>=8.1.8",
     "litellm>=1.65.4.post1",
     "lxml>=5.3.2",

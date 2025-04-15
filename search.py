@@ -5,6 +5,7 @@ import shutil
 import time
 
 import click
+from click_default_group import DefaultGroup
 from pydantic import BaseModel
 
 from deepsearch_code import core, oracles, search_tools
@@ -15,7 +16,7 @@ from deepsearch_code.utils import async_command, setup_logging
 REPOS_DIR = ".repos"
 
 
-@click.group()
+@click.group(cls=DefaultGroup, default="search", default_if_no_args=True)
 def cli():
     pass
 
@@ -37,7 +38,10 @@ class ToolStats:
 
 
 def search_agent(
-    repo: str, oracle: core.Oracle, questions: search_tools.ResearchQuestions
+    repo: str,
+    repo_path: str,
+    oracle: core.Oracle,
+    questions: search_tools.ResearchQuestions,
 ) -> core.Agent:
     conversation = core.Conversation(oracle)
 
@@ -50,8 +54,6 @@ You'll be researching the following repository: {repo}. In order to answer quest
 In your response, please include key links to files within the repository as markdown links, using relative paths from the repository root, optionally with line numbers or ranges in the hash parameter. [for example](README.md#L112-L145)
 """.strip()
     )
-
-    repo_path = os.path.join(REPOS_DIR, repo)
 
     shell = search_tools.Shell(repo_path)
     ripgrep = search_tools.ripgrep_tool(shell)
@@ -90,7 +92,8 @@ In your response, please include key links to files within the repository as mar
 
 
 class ResearchConversation(BaseModel):
-    repo: str
+    repo_name: str
+    repo_path: str
     question: str
     answer: str
     research_questions: dict[str, str]
@@ -109,43 +112,13 @@ def readable_time(seconds: float) -> str:
             continue
         current -= whole_values * period
         parts.append(f"{whole_values}{letter}")
-    
+
     return "".join(parts)
 
 
-@async_command(cli)
-@click.argument("repo")
-@click.argument("question")
-@click.option("--download", is_flag=True)
-@click.option("--repl", is_flag=True)
-@click.option("-i", "--input", default=None)
-@click.option("-o", "--output", default=None)
-@click.option("--researcher-model", default="google/gemini-2.0-flash-001")
-@click.option("--manager-model", default="google/gemini-2.5-pro-preview-03-25")
-async def search(
-    repo: str,
-    question: str,
-    download: bool,
-    repl: bool,
-    output: str | None,
-    input: str | None,
-    researcher_model: str,
-    manager_model: str,
-) -> None:
-    setup_logging()
-
-    existing: ResearchConversation | None = None
-    if input:
-        with open(input) as f:
-            json_data = json.load(f)
-        existing = ResearchConversation.model_validate(json_data)
-        if existing.repo != repo:
-            raise click.Abort(
-                f"The conversation at {input} is about {existing.repo}, not {repo}"
-            )
-
+async def maybe_download_repo(repo: str) -> str:
     repo_path = os.path.join(REPOS_DIR, repo)
-    if not os.path.isdir(repo_path) or download:
+    if not os.path.isdir(repo_path):
         if os.path.isdir(repo_path):
             shutil.rmtree(repo_path)
         os.makedirs(repo_path)
@@ -154,11 +127,89 @@ async def search(
     else:
         print("Already downloaded", repo)
 
+    return repo_path
+
+
+@async_command(cli)
+@click.argument("question")
+@click.option(
+    "-r",
+    "--repo",
+    help="Provide the name of a github repository to perform the search on. Conflicts with `--path`",
+)
+@click.option(
+    "-p",
+    "--path",
+    help="Path to a directory that the agent should run in. Conflicts with `--repo`.",
+)
+@click.option(
+    "-i",
+    "--input",
+    default=None,
+    help="Path to a JSON file produced with the -o flag in a prior run. This can be used to provide feedback to the agent and make changes to the final response.",
+)
+@click.option("-o", "--output", default=None)
+@click.option(
+    "--model",
+    help="Default model. Will be used as both researcher and manager unless --researcher-model or --manager-mdoel is passed.",
+)
+@click.option(
+    "--researcher-model",
+    help="Model to use for the researcher agent. Most of the tokens will be run through this model.",
+)
+@click.option(
+    "--manager-model",
+    default="google/gemini-2.5-pro-preview-03-25",
+    help="Model to use as the 'manager' which is responsible for the final response. This will use fewer tokens in most cases than researcher-model.",
+)
+@click.option(
+    "--debug",
+    is_flag=True,
+    help="All agents will be controlled manually by the user via user input. No LLMs will be used.",
+)
+async def search(
+    repo: str | None,
+    path: str | None,
+    question: str,
+    output: str | None,
+    input: str | None,
+    model: str | None,
+    researcher_model: str | None,
+    manager_model: str | None,
+    debug: bool,
+) -> None:
+    setup_logging()
+
+    if sum([repo is not None, path is not None, input is not None]) > 1:
+        raise click.BadArgumentUsage("Only one of --repo, --path, or --input may be specified")
+
+    existing: ResearchConversation | None = None
+    repo_name: str
+    repo_path: str
+    if input:
+        with open(input) as f:
+            json_data = json.load(f)
+        existing = ResearchConversation.model_validate(json_data)
+        if existing.repo != repo:
+            raise click.Abort(
+                f"The conversation at {input} is about {existing.repo}, not {repo}"
+            )
+        repo_name = existing.repo_name
+        repo_path = existing.repo_path
+    elif repo is not None:
+        repo_name = repo
+        repo_path = await maybe_download_repo(repo)
+    else:
+        if path is None:
+            path = "."
+        repo_name = os.path.basename(path)
+        repo_path = path
+
     client = get_openrouter_client()
     tracker = oracles.UsageTracker()
     manager_oracle: core.Oracle
     researcher_oracle: core.Oracle
-    if repl:
+    if debug:
         manager_oracle = oracles.ReplOracle()
         researcher_oracle = oracles.ReplOracle()
     else:
@@ -179,7 +230,7 @@ async def search(
         existing.research_questions if existing is not None else None
     )
 
-    search = search_agent(repo, researcher_oracle, questions)
+    search = search_agent(repo_name, repo_path, researcher_oracle, questions)
 
     manager_convo = core.Conversation(
         manager_oracle, existing.manager_messages if existing is not None else None
@@ -196,14 +247,13 @@ async def search(
     print(response.answer)
 
     print()
-    print(f"Elapsed: ", readable_time(elapsed))
+    print("Elapsed: ", readable_time(elapsed))
     print("LLM Usage:")
     llms = sorted(tracker.models.items(), key=lambda x: x[1]["total"], reverse=True)
     for llm, usage in llms:
         print(
             f"- {llm}: {usage['input']} input tokens ({usage['cached_input']} "
             f"cached), output {usage['output']}"
-            
         )
 
     print()
@@ -216,7 +266,8 @@ async def search(
         return
 
     result = ResearchConversation(
-        repo=repo,
+        repo_name=repo_name,
+        repo_path=repo_path,
         question=question,
         answer=response.answer,
         research_questions=questions.questions,
