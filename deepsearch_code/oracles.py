@@ -351,7 +351,7 @@ You have {self.allowed_attempts - failures} attempt(s) remaining.
             if error:
                 LOGGER.warn(
                     "The tool call args did not match the expected schema; args: %s, error: %s",
-                    tool_args,
+                    body_text,
                     error,
                 )
                 failures += 1

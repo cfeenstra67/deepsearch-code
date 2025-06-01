@@ -73,11 +73,11 @@ def awk_tool(shell: Shell) -> core.Tool:
         Example 2, Sum the first column and report the average: ["-F,", "{ sum+=$1 } END { print "total", sum, \"avg\", sum/NR }", "**/*.txt"]
         """
         cmd_args = list(cmd_args)
-        for idx, arg in cmd_args:
+        for idx, arg in enumerate(cmd_args):
             if not arg.startswith("*"):
                 continue
             del cmd_args[idx]
-            expanded = glob.glob(arg, shell.cwd)
+            expanded = glob.glob(arg, root_dir=shell.cwd)
             for item in expanded:
                 cmd_args.insert(idx, item)
 

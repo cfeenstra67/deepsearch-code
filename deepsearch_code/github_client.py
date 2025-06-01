@@ -91,3 +91,12 @@ async def list_pull_request_comments(
         session, repo_name, f"issues/{pr_number}/comments"
     ):
         yield item
+
+
+async def list_issue_comments(
+    session: aiohttp.ClientSession, repo_name: str, issue_number: int
+):
+    async for item in list_github_objects(
+        session, repo_name, f"issues/{issue_number}/comments"
+    ):
+        yield item

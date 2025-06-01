@@ -57,11 +57,11 @@ def release_filename(release):
     tag_name = release["tag_name"]
     created_at = release["created_at"]
     created_date = created_at.split("T")[0]
-    
+
     sluggified_name = re.sub(r"[^0-9a-zA-Z]", "-", tag_name.lower())
     sluggified_name = re.sub(r"-+", "-", sluggified_name)
     sluggified_name = sluggified_name[:100]
-    
+
     return f"{created_date}-{sluggified_name}.md"
 
 
@@ -126,7 +126,8 @@ async def format_pull_request(
         for idx, comment in enumerate(comments):
             lines.extend(
                 [
-                    f"### Comment {idx + 1}From: {comment['user']['login']}",
+                    f"### Comment {idx + 1}",
+                    f"From: {comment['user']['login']}",
                     f"Date: {comment['created_at']}",
                     "",
                     comment["body"],
@@ -153,7 +154,7 @@ async def format_release(release) -> str:
     created_at = release["created_at"]
     published_at = release.get("published_at")
     author = release["author"]["login"] if release.get("author") else "Unknown"
-    
+
     lines = [
         f"# {release_name} ({tag_name})",
         release_body,
@@ -164,10 +165,10 @@ async def format_release(release) -> str:
         f"Prerelease: {prerelease}",
         f"Created at: {created_at}",
     ]
-    
+
     if published_at:
         lines.append(f"Published at: {published_at}")
-    
+
     return "\n".join(lines).strip()
 
 
@@ -184,13 +185,15 @@ async def format_issue(issue, repo: "Repository", semaphore: asyncio.Semaphore) 
     created_at = issue["created_at"]
     closed_at = issue.get("closed_at")
     assignees = [assignee["login"] for assignee in issue["assignees"]]
-    milestone = issue.get("milestone", {}).get("title") if issue.get("milestone") else None
+    milestone = (
+        issue.get("milestone", {}).get("title") if issue.get("milestone") else None
+    )
     author = issue["user"]["login"]
     repo_name = f"{repo.owner}/{repo.repo}"
 
     async with semaphore:
         comments = []
-        async for comment in github_client.list_pull_request_comments(
+        async for comment in github_client.list_issue_comments(
             session, repo_name, issue_num
         ):
             comments.append(comment)
@@ -202,18 +205,18 @@ async def format_issue(issue, repo: "Repository", semaphore: asyncio.Semaphore) 
         f"State: {issue_state}",
         f"Author: {author}",
     ]
-    
+
     if issue_labels:
         lines.append(f"Labels: {', '.join(issue_labels)}")
-    
+
     lines.append(f"Created at: {created_at}")
-    
+
     if closed_at:
         lines.append(f"Closed at: {closed_at}")
-    
+
     if milestone:
         lines.append(f"Milestone: {milestone}")
-    
+
     lines.append(f"Assignees: {', '.join(assignees)}")
 
     if comments:
@@ -251,6 +254,8 @@ Additional metadata has been added about the repository within the {rel_path} su
 - {rel_path}/commits.txt - The output of "git log", showing details about all commits in the current branch.
 - {rel_path}/tags.txt - The output of "git tag", showing the names of all of the individual tags in the repository.
 - {rel_path}/pulls/*.md - Information about all pull requests in the repository, formatted as markdown.
+- {rel_path}/releases/*.md - Information about all releases in the repository, formatted as markdown.
+- {rel_path}/issues/*.md - Information about all issues in the repository, formatted as markdown.
 """.strip()
 
     async def __aenter__(self) -> "Repository":
@@ -284,6 +289,8 @@ Additional metadata has been added about the repository within the {rel_path} su
         await self.write_commits(overwrite=overwrite)
         await self.write_tags(overwrite=overwrite)
         await self.write_pull_requests(overwrite=overwrite)
+        await self.write_releases(overwrite=overwrite)
+        await self.write_issues(overwrite=overwrite)
 
     def _meta_dir(self) -> str:
         meta_dir = os.path.join(self.path, "REPO-METADATA")
@@ -347,6 +354,68 @@ Additional metadata has been added about the repository within the {rel_path} su
         to_remove = set(os.listdir(pulls_path)) - names
         for file in to_remove:
             os.remove(os.path.join(pulls_path, file))
+
+    async def write_releases(self, overwrite: bool = False) -> None:
+        if self.client_session is None:
+            raise RuntimeError("Repository must be used as an async context manager")
+
+        releases_path = os.path.join(self._meta_dir(), "releases")
+        if not os.path.exists(releases_path):
+            os.makedirs(releases_path)
+
+        names: set[str] = set()
+        async for release in github_client.list_releases(
+            self.client_session, f"{self.owner}/{self.repo}"
+        ):
+            file_name = release_filename(release)
+            file_path = os.path.join(releases_path, file_name)
+            names.add(file_name)
+            if os.path.exists(file_path) and not overwrite:
+                continue
+
+            file_body = await format_release(release)
+            with open(file_path, "w+") as f:
+                f.write(file_body)
+
+            LOGGER.debug("Wrote release '%s'", release["tag_name"])
+
+        to_remove = set(os.listdir(releases_path)) - names
+        for file in to_remove:
+            os.remove(os.path.join(releases_path, file))
+
+    async def write_issues(self, overwrite: bool = False) -> None:
+        if self.client_session is None:
+            raise RuntimeError("Repository must be used as an async context manager")
+
+        issues_path = os.path.join(self._meta_dir(), "issues")
+        if not os.path.exists(issues_path):
+            os.makedirs(issues_path)
+
+        semaphore = asyncio.Semaphore(10)
+
+        names: set[str] = set()
+        async for issue in github_client.list_issues(
+            self.client_session, f"{self.owner}/{self.repo}"
+        ):
+            # Skip pull requests (GitHub API returns PRs as issues)
+            if "pull_request" in issue:
+                continue
+
+            file_name = issue_filename(issue)
+            file_path = os.path.join(issues_path, file_name)
+            names.add(file_name)
+            if os.path.exists(file_path) and not overwrite:
+                continue
+
+            file_body = await format_issue(issue, self, semaphore)
+            with open(file_path, "w+") as f:
+                f.write(file_body)
+
+            LOGGER.debug("Wrote issue #%s '%s'", issue["number"], issue["title"])
+
+        to_remove = set(os.listdir(issues_path)) - names
+        for file in to_remove:
+            os.remove(os.path.join(issues_path, file))
 
     def checkout_tool(self) -> core.Tool:
         @core.tool
