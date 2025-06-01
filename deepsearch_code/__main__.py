@@ -155,11 +155,6 @@ async def search(
 ) -> None:
     setup_logging()
 
-    if sum([repo is not None, input is not None]) > 1:
-        raise click.BadArgumentUsage(
-            "Only one of --repo, --path, or --input may be specified"
-        )
-
     if researcher_model is None:
         researcher_model = "google/gemini-2.0-flash-001"
     if manager_model is None:
