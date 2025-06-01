@@ -1,116 +1,11 @@
-import asyncio
 import difflib
+import glob
 import os
-import tempfile
 
 from pydantic import BaseModel, Field
 
 from deepsearch_code import core
-
-
-class ScrollableString:
-    def __init__(
-        self, value: str, line_limit: int, scroll_cushion: int | None = None
-    ) -> None:
-        if scroll_cushion is None:
-            scroll_cushion = max(1, int(line_limit / 10))
-        self.value = value
-        self.lines = value.splitlines()
-        self.line_limit = line_limit
-        self.line_offset = 0
-        self.scroll_cushion = scroll_cushion
-
-    def scroll_to(self, line: int) -> tuple[str, list[core.Tool]]:
-        min_offset = 0
-        max_offset = max(len(self.lines) - self.line_limit, 0)
-
-        expected_offset = line - (self.line_limit // 2)
-        new_offset = max(min_offset, min(max_offset, expected_offset))
-
-        self.line_offset = new_offset
-
-        return self.output()
-
-    def scroll_down(self) -> tuple[str, list[core.Tool]]:
-        """
-        Scroll the displayed content down
-        """
-        max_offset = max(len(self.lines) - self.line_limit, 0)
-        if self.line_offset >= max_offset:
-            return self.output()
-
-        new_offset = self.line_offset + self.line_limit - self.scroll_cushion
-        self.line_offset = min(new_offset, max_offset)
-
-        return self.output()
-
-    def scroll_up(self) -> tuple[str, list[core.Tool]]:
-        """
-        Scroll the displayed content up
-        """
-        min_offset = 0
-        if self.line_offset <= min_offset:
-            return self.output()
-
-        new_offset = self.line_offset - self.line_limit + self.scroll_cushion
-        self.line_offset = max(new_offset, min_offset)
-
-        return self.output()
-
-    def output(self) -> tuple[str, list[core.Tool]]:
-        if self.value == "":
-            return "<no content>", []
-
-        if len(self.lines) <= self.line_limit:
-            return self.value, []
-
-        tools: list[core.Tool] = []
-
-        out_lines: list[str] = []
-        if self.line_offset > 0:
-            out_lines.append(
-                f"--- {self.line_offset} line(s) hidden, scroll up to view ---"
-            )
-            tools.append(core.tool(self.scroll_up))
-
-        out_lines.extend(
-            self.lines[self.line_offset : self.line_offset + self.line_limit]
-        )
-
-        end_offset = len(self.lines) - (self.line_offset + self.line_limit)
-        if end_offset > 0:
-            out_lines.append(
-                f"--- {end_offset} line(s) hidden, scroll down to view ---"
-            )
-            tools.append(core.tool(self.scroll_down))
-
-        return "\n".join(out_lines), tools
-
-
-class Shell:
-    def __init__(self, cwd: str = ".", line_limit: int = 500) -> None:
-        self.cwd = cwd
-        self.line_limit = line_limit
-
-    def view(self, value: str) -> ScrollableString:
-        return ScrollableString(value, self.line_limit)
-
-
-async def run_tool_command(
-    cmd: str, args: list[str], shell: Shell
-) -> tuple[str, list[core.Tool]]:
-    with tempfile.TemporaryFile() as ntf, open(os.devnull, "ab") as devnull:
-        process = await asyncio.create_subprocess_exec(
-            cmd, *args, stdout=ntf, stderr=ntf, stdin=devnull, cwd=shell.cwd
-        )
-
-        await process.wait()
-
-        ntf.flush()
-        ntf.seek(0)
-        result = ntf.read().decode()
-
-        return shell.view(result).output()
+from deepsearch_code.shell import Shell, run_tool_command
 
 
 def ripgrep_tool(shell: Shell) -> core.Tool:
@@ -158,6 +53,37 @@ def tree_tool(shell: Shell) -> core.Tool:
         return await run_tool_command("tree", cmd_args, shell)
 
     return tree
+
+
+def awk_tool(shell: Shell) -> core.Tool:
+    @core.tool
+    async def awk(cmd_args: list[str]) -> tuple[str, list[core.Tool]]:
+        """
+        awk is a small but expressive data-driven language that reads one line at a time from standard input or a list of files, splits each line into fields (default: whitespace, or any regular expression you give with -F), then runs every line through a set of pattern > action rules-printing lines that match, transforming fields, accumulating statistics, or driving shell pipelines all in a single pass. You'll pass the command line arguments as an array. The first argument must always be first. Some of the key arguments be aware of are:
+        - -F fs Set the input field separator FS to the regular-expression _fs_
+        - -v var=val Assign shell vars before the program starts (e.g., -v total=0)
+        - 'prog' Inline program in single quotes, e.g. 'NF>2 {print $1,$NF}'
+        - -f file Load the program from a file (may repeat)
+        - Pattern syntax /regex/, relational ($3>100), or range /start/,/end/
+        - Actions Anything inside { }, defaults to {print $0} if omitted
+        - Field/record vars $0 (whole line), $1...$NF (fields), NR/FNR (line numbers), NF (field count)
+        - Special blocks BEGIN { ... } (runs once before input) and END { ... } (after all input)
+        - Handy statements print, printf, next (skip to next record), exit, split(), gsub()
+        Example 1, Print the second column of a CSV file: ["-F,", "{ print $2 }", "data.csv"]
+        Example 2, Sum the first column and report the average: ["-F,", "{ sum+=$1 } END { print "total", sum, \"avg\", sum/NR }", "**/*.txt"]
+        """
+        cmd_args = list(cmd_args)
+        for idx, arg in cmd_args:
+            if not arg.startswith("*"):
+                continue
+            del cmd_args[idx]
+            expanded = glob.glob(arg, shell.cwd)
+            for item in expanded:
+                cmd_args.insert(idx, item)
+
+        return await run_tool_command("awk", cmd_args, shell)
+
+    return awk
 
 
 class ReadFileArgs(BaseModel):

@@ -13,8 +13,8 @@ You can run `deepsearch-code` by doing one of the following:
 pip install git+https://github.com/cfeenstra67/deepsearch-code
 deepsearch-code
 # uv
-uv add https://github.com/cfeenstra67/deepsearch-code
+uv add git+https://github.com/cfeenstra67/deepsearch-code
 deepsearch-code <args>
 # uvx
-uvx --from https://github.com/cfeenstra67/deepsearch-code deepsearch-code
+uvx --from git+https://github.com/cfeenstra67/deepsearch-code deepsearch-code
 ```

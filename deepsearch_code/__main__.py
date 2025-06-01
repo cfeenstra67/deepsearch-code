@@ -1,6 +1,4 @@
 import json
-import os
-import shutil
 import time
 
 import click
@@ -8,8 +6,8 @@ from click_default_group import DefaultGroup
 from pydantic import BaseModel
 
 from deepsearch_code import core, oracles, search_tools
-from deepsearch_code.download import download_repo
 from deepsearch_code.openrouter import get_openrouter_client
+from deepsearch_code.repo import Repository, download_github_repo
 from deepsearch_code.utils import async_command, setup_logging
 
 REPOS_DIR = ".repos"
@@ -37,33 +35,40 @@ class ToolStats:
 
 
 def search_agent(
-    repo: str,
-    repo_path: str,
+    repo: Repository,
     oracle: core.Oracle,
     questions: search_tools.ResearchQuestions,
 ) -> core.Agent:
     conversation = core.Conversation(oracle)
 
-    prompt = core.StringPrompt(
-        f"""
+    def create_prompt() -> str:
+        return f"""
 You are a seasoned researcher who thinks deeply, synthesizes large amounts of information and produces comprehensive and precise yet concise responses. Responses should be a long as needed to answer the user's question and no more.
 
-You'll be researching the following repository: {repo}. In order to answer questions about it, you'll have the ability to read files and search files within the repository, and you'll have to piece together your answer based on the content of the repository. Even if you think you already know the answer, you should find code that confirms your priors.
+You'll be researching the following repository: {repo.owner}/{repo.repo}. In order to answer questions about it, you'll have the ability to read files and search files within the repository, and you'll have to piece together your answer based on the content of the repository. Even if you think you already know the answer, you should find code that confirms your priors.
 
-In your response, please include key links to files within the repository as markdown links, using relative paths from the repository root, optionally with line numbers or ranges in the hash parameter. [for example](README.md#L112-L145)
+{repo.meta_description()}
+
+Currently the checked out reference is: {repo.branch}
+
+In your response, please include key links to files within the repository as markdown links, using relative paths from the repository root, optionally with line numbers or ranges in the hash parameter in the same manner as used on Github. [for example](README.md#L112-L145)
 """.strip()
-    )
 
-    shell = search_tools.Shell(repo_path)
+    prompt = core.FunctionPrompt(create_prompt)
+
+    shell = search_tools.Shell(repo.path)
     ripgrep = search_tools.ripgrep_tool(shell)
     find = search_tools.find_tool(shell)
     tree = search_tools.tree_tool(shell)
     read_file = search_tools.read_file_tool(shell)
+    awk = search_tools.awk_tool(shell)
+    checkout = repo.checkout_tool()
+    diff = repo.diff_tool(shell)
 
     return core.BasicAgent(
         conversation,
         prompt=core.Prompts([prompt, questions.prompt()]),
-        tools=[find, tree, ripgrep, read_file],
+        tools=[find, tree, ripgrep, read_file, awk, checkout, diff],
     )
 
 
@@ -92,7 +97,6 @@ In your response, please include key links to files within the repository as mar
 
 class ResearchConversation(BaseModel):
     repo_name: str
-    repo_path: str
     question: str
     answer: str
     research_questions: dict[str, str]
@@ -115,32 +119,9 @@ def readable_time(seconds: float) -> str:
     return "".join(parts)
 
 
-async def maybe_download_repo(repo: str) -> str:
-    repo_path = os.path.join(REPOS_DIR, repo)
-    if not os.path.isdir(repo_path):
-        if os.path.isdir(repo_path):
-            shutil.rmtree(repo_path)
-        os.makedirs(repo_path)
-        await download_repo(repo, repo_path)
-        print("Downloaded", repo)
-    else:
-        print("Already downloaded", repo)
-
-    return repo_path
-
-
 @async_command(cli)
+@click.argument("repo")
 @click.argument("question")
-@click.option(
-    "-r",
-    "--repo",
-    help="Provide the name of a github repository to perform the search on. Conflicts with `--path`",
-)
-@click.option(
-    "-p",
-    "--path",
-    help="Path to a directory that the agent should run in. Conflicts with `--repo`.",
-)
 @click.option(
     "-i",
     "--input",
@@ -149,14 +130,12 @@ async def maybe_download_repo(repo: str) -> str:
 )
 @click.option("-o", "--output", default=None)
 @click.option(
-    "--model",
-    help="Default model. Will be used as both researcher and manager unless --researcher-model or --manager-mdoel is passed.",
-)
-@click.option(
+    "-r",
     "--researcher-model",
     help="Model to use for the researcher agent. Most of the tokens will be run through this model.",
 )
 @click.option(
+    "-m",
     "--manager-model",
     help="Model to use as the 'manager' which is responsible for the final response. This will use fewer tokens in most cases than researcher-model.",
 )
@@ -166,88 +145,75 @@ async def maybe_download_repo(repo: str) -> str:
     help="All agents will be controlled manually by the user via user input. No LLMs will be used.",
 )
 async def search(
-    repo: str | None,
-    path: str | None,
+    repo: str,
     question: str,
     output: str | None,
     input: str | None,
-    model: str | None,
     researcher_model: str | None,
     manager_model: str | None,
     debug: bool,
 ) -> None:
     setup_logging()
 
-    if sum([repo is not None, path is not None, input is not None]) > 1:
+    if sum([repo is not None, input is not None]) > 1:
         raise click.BadArgumentUsage(
             "Only one of --repo, --path, or --input may be specified"
         )
 
-    if model is None and researcher_model is None:
-        researcher_model = "google/gemini-2.0-flash-001"
-    if model is None:
-        model = "google/gemini-2.5-pro-preview-03-25"
-    if manager_model is None:
-        manager_model = model
     if researcher_model is None:
-        researcher_model = model
+        researcher_model = "google/gemini-2.0-flash-001"
+    if manager_model is None:
+        manager_model = "google/gemini-2.5-pro-preview-03-25"
 
     existing: ResearchConversation | None = None
-    repo_name: str
-    repo_path: str
     if input:
         with open(input) as f:
             json_data = json.load(f)
         existing = ResearchConversation.model_validate(json_data)
-        repo_name = existing.repo_name
-        repo_path = existing.repo_path
-    elif repo is not None:
-        repo_name = repo
-        repo_path = await maybe_download_repo(repo)
-    else:
-        if path is None:
-            path = "."
-        repo_name = os.path.basename(path)
-        repo_path = path
+        if existing.repo_name != repo:
+            raise click.Abort(
+                f"The --input is for the {existing.repo_name} repo, but you passed {repo}"
+            )
 
-    client = get_openrouter_client()
-    tracker = oracles.UsageTracker()
-    manager_oracle: core.Oracle
-    researcher_oracle: core.Oracle
-    if debug:
-        manager_oracle = oracles.ReplOracle()
-        researcher_oracle = oracles.ReplOracle()
-    else:
-        manager_oracle = oracles.LLMOracle(
-            model=manager_model,
-            client=client,
-            tracker=tracker,
+    async with download_github_repo(repo) as repo_obj:
+        client = get_openrouter_client()
+        tracker = oracles.UsageTracker()
+        manager_oracle: core.Oracle
+        researcher_oracle: core.Oracle
+        if debug:
+            manager_oracle = oracles.ReplOracle()
+            researcher_oracle = oracles.ReplOracle()
+        else:
+            manager_oracle = oracles.LLMOracle(
+                model=manager_model,
+                client=client,
+                tracker=tracker,
+            )
+            researcher_oracle = oracles.LLMOracle(
+                model=researcher_model,
+                client=client,
+                tracker=tracker,
+            )
+
+        stats = ToolStats()
+
+        questions = search_tools.ResearchQuestions(
+            existing.research_questions if existing is not None else None
         )
-        researcher_oracle = oracles.LLMOracle(
-            model=researcher_model,
-            client=client,
-            tracker=tracker,
+
+        search = search_agent(repo_obj, researcher_oracle, questions)
+
+        manager_convo = core.Conversation(
+            manager_oracle, existing.manager_messages if existing is not None else None
         )
 
-    stats = ToolStats()
+        manager = manager_agent(repo, manager_convo, questions, search)
 
-    questions = search_tools.ResearchQuestions(
-        existing.research_questions if existing is not None else None
-    )
+        start = time.time()
 
-    search = search_agent(repo_name, repo_path, researcher_oracle, questions)
+        response = await manager.run(question)
 
-    manager_convo = core.Conversation(
-        manager_oracle, existing.manager_messages if existing is not None else None
-    )
-
-    manager = manager_agent(repo_name, manager_convo, questions, search)
-
-    start = time.time()
-
-    response = await manager.run(question)
-
-    elapsed = time.time() - start
+        elapsed = time.time() - start
 
     print(response)
 
@@ -271,8 +237,7 @@ async def search(
         return
 
     result = ResearchConversation(
-        repo_name=repo_name,
-        repo_path=repo_path,
+        repo_name=repo,
         question=question,
         answer=response,
         research_questions=questions.questions,

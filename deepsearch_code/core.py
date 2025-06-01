@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import textwrap
+import time
 from typing import (
     Any,
     Awaitable,
@@ -427,17 +428,35 @@ class BasicAgent(Agent):
             if not candidates:
                 raise NoToolsAvailable
 
+            before_ask = time.perf_counter()
+
             raw, tool, args = await self.conversation.ask(message, candidates, prompt)
+
+            after_ask = time.perf_counter()
 
             tool_name = tool.name()
             LOGGER.info(
-                "Response from agent to '%s': %s(%r)", question, tool_name, args
+                "Response from agent to '%s' after %.2fs: %s(%r)",
+                question,
+                after_ask - before_ask,
+                tool_name,
+                args,
             )
             LOGGER.debug("Raw: %s", raw.content)
 
             await agent_responded.send_async(self, raw=raw, tool=tool, args=args)
 
+            before_tool_call = time.perf_counter()
+
             response, follow_up_tools = await tool.call(args)
+
+            after_tool_call = time.perf_counter()
+
+            LOGGER.debug(
+                "Tool '%s' completed after %.2fs",
+                tool_name,
+                after_tool_call - before_tool_call,
+            )
 
             await tool_called.send_async(self, tool=tool, args=args, response=response)
 

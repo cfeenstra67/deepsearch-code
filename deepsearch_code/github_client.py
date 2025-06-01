@@ -49,3 +49,45 @@ async def download_repo_tarball(
         async with aiofiles.open(output_path, mode="wb+") as f:
             async for chunk in response.content.iter_chunked(8192):
                 await f.write(chunk)
+
+
+async def list_github_objects(
+    session: aiohttp.ClientSession, repo_name: str, object: str, per_page: int = 100
+):
+    url = f"/repos/{repo_name}/{object}"
+    page = 1
+    last_page_size = None
+
+    while last_page_size is None or last_page_size == per_page:
+        async with await session.get(
+            url, params={"per_page": per_page, "page": page}, raise_for_status=True
+        ) as resp:
+            data = await resp.json()
+
+        last_page_size = len(data)
+        for item in data:
+            yield item
+
+
+async def list_pull_requests(session: aiohttp.ClientSession, repo_name: str):
+    async for item in list_github_objects(session, repo_name, "pulls"):
+        yield item
+
+
+async def list_releases(session: aiohttp.ClientSession, repo_name: str):
+    async for item in list_github_objects(session, repo_name, "releases"):
+        yield item
+
+
+async def list_issues(session: aiohttp.ClientSession, repo_name: str):
+    async for item in list_github_objects(session, repo_name, "issues"):
+        yield item
+
+
+async def list_pull_request_comments(
+    session: aiohttp.ClientSession, repo_name: str, pr_number: int
+):
+    async for item in list_github_objects(
+        session, repo_name, f"issues/{pr_number}/comments"
+    ):
+        yield item
